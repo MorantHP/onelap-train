@@ -1,0 +1,19 @@
+# 真实配置与密钥 —— 绝不提交
+config.json
+
+# 运行产物
+logs/
+report_*.md
+data_*.json
+imported_*.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 临时 / 调试文件
+_*.js
+_*.html
+_*.log
+_*.out
+*.tmp

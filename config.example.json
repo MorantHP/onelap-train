@@ -1,0 +1,20 @@
+{
+  "_说明": "复制本文件为 config.json，再填你自己的值。config.json 已在 .gitignore 中、不会被提交。",
+  "_token怎么拿": "浏览器登录 otm.onelap.cn → F12 → Application(应用) → Local Storage → https://otm.onelap.cn → 复制名为 token 的值（约 48 小时过期）",
+  "_refresh_token_可选但建议": "服务端每日自动跑(--auto)建议填 refresh_token 自动续期，否则约48小时后 token 过期、任务失败。拿法：otm.onelap.cn 退出后重新登录(手机验证码) → F12 → Application → Local Storage → 复制 refresh_token 的值。",
+
+  "token": "<在此粘贴你的 OTM access token>",
+  "refresh_token": "<可选：粘贴 refresh_token 启用自动续期；不用就留空>",
+  "cookie": "",
+
+  "_报告日期范围_可选": "",
+  "days_back": 14,
+  "days_ahead": 14,
+
+  "_AI教练_必填glm_api_key才生成计划": "智谱开放平台 key（open.bigmodel.cn）。模型固定 glm-5.2，账户需有 glm-5.2 额度（glm-4-flash 免费但算出的训练强度 IF 不准，不建议）。",
+  "glm_api_key": "<在此粘贴你的智谱 glm api key>",
+  "glm_endpoint": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+
+  "_微信推送_必填serverchan_key才推送": "Server酱 SendKey（sct.ftqq.com 用微信登录拿）。",
+  "serverchan_key": "<在此粘贴你的 Server酱 SendKey>"
+}
