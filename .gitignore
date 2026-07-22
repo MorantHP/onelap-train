@@ -1,5 +1,8 @@
-# 真实配置与密钥 —— 绝不提交
+# 真实配置与密钥 / 个人健康数据 —— 绝不提交
 config.json
+readiness.json
+readiness_history.jsonl
+.readiness_last_trigger
 
 # 运行产物
 logs/

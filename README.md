@@ -55,6 +55,32 @@ python onelap_report.py --sample      # 用假数据预览，不联网
 
 ---
 
+## 私人教练档案 & 每日 readiness（可选，强烈推荐）
+
+在 `config.json` 填 `coach_profile`，AI 教练就会按**你的体重 / FTP / 目标 / 训练时间窗 / 季节阶段**排课，并给减脂增肌的饮食建议：
+
+```json
+"coach_profile": {
+  "weight_kg": 79, "ftp": 244, "goal": "提高FTP+爬坡+速度；同时减脂增肌",
+  "location": "beijing", "phase": "base",
+  "schedule": {
+    "weekday_am": "5:30-7:30 可骑行，须 8:00 前到家",
+    "weekday_pm": "17:30 之后可骑行/力量/跑步",
+    "weekend": "可安排长骑",
+    "winter_note": "冬天无法户外，改室内骑行台"
+  },
+  "devices": ["apple_watch"]
+}
+```
+
+> `phase` 取 `recovery / base / build / peak / in_season / transition`，随训练阶段手动调整。
+
+**每日 readiness**（睡眠 / HRV / 静息心率 / 主观）写进 `readiness.json` 后，教练会据此**当天升降强度**：综合打分 0-100（绿≥80 / 黄 65-79 / 橙 50-64 / 红<50），其中 HRV、静息心率相对**你的个人滚动基线**评判（基线从历史自动累积，约 1 周后开始生效）。
+
+readiness 数据怎么自动来？用 **iPhone「快捷指令」每天早晨把 Apple Watch 健康数据 POST 到服务器**——纯标准库接收端 `readiness_server.py`（带 token 鉴权 + 字段校验，可选「数据到达后自动重跑 `--auto`」）。完整搭建见 **[DEPLOY.md「5C. Apple Watch 健康数据接入」](DEPLOY.md#5c-可选-apple-watch-健康数据--readinessjson)**。
+
+---
+
 ## 每日自动运行
 
 详细部署见 **[DEPLOY.md](DEPLOY.md)**（含排错表）。两平台要点：
@@ -119,10 +145,12 @@ python onelap_report.py --sample      # 用假数据预览，不联网
 ```
 onelap-train/
 ├── onelap_report.py        # 主程序（纯标准库）
+├── readiness_server.py     # （可选）Apple Watch 健康数据接收端
 ├── config.example.json     # 配置模板（复制为 config.json 后填值）
 ├── config.json             # 你的配置（自行创建，.gitignore 已忽略）
+├── readiness.json          # （可选）当日 readiness（iPhone 快捷指令写入，.gitignore 已忽略）
 ├── run_auto.bat            # Windows 任务计划程序启动脚本
-├── DEPLOY.md               # 部署文档（Linux cron / Windows 任务计划）
+├── DEPLOY.md               # 部署文档（Linux cron / Windows 任务计划 / readiness 接收端）
 ├── README.md
 ├── LICENSE                 # MIT
 ├── logs/auto.log           # 运行日志（自动生成）

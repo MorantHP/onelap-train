@@ -16,5 +16,26 @@
   "glm_endpoint": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
 
   "_微信推送_必填serverchan_key才推送": "Server酱 SendKey（sct.ftqq.com 用微信登录拿）。",
-  "serverchan_key": "<在此粘贴你的 Server酱 SendKey>"
+  "serverchan_key": "<在此粘贴你的 Server酱 SendKey>",
+
+  "_私人教练档案_可选": "填了 coach_profile，AI 教练会按你的体重/FTP/目标/时间表/季节与当日 readiness 排课，并给饮食建议。phase 取 recovery/base/build/peak/in_season/transition。readiness.json（Apple Watch 捷径每日写入）也参与调强度。",
+  "coach_profile": {
+    "weight_kg": 70,
+    "ftp": 200,
+    "goal": "提高FTP+爬坡+速度",
+    "location": "your-city",
+    "phase": "base",
+    "schedule": {
+      "weekday_am": "如 5:30-7:30 可骑行，8点前到家",
+      "weekday_pm": "如 18:00 之后可骑行/力量/跑步",
+      "weekend": "可安排长骑",
+      "winter_note": "冬天若无法户外，改室内骑行台"
+    },
+    "devices": []
+  },
+
+  "_readiness接收端_可选": "配 readiness_server.py：iPhone 快捷指令每天早晨把 Apple Watch 健康数据（睡眠/HRV/静息心率/主观）POST 过来。readiness_token=鉴权密钥（自己生成随机串）；readiness_listen=监听地址，服务器部署用 0.0.0.0:端口 并放行防火墙；readiness_trigger_auto=true 时数据一到就自动重跑一次 --auto（醒来即刷新计划+推送）。详见 DEPLOY.md「readiness 接收端」。",
+  "readiness_listen": "0.0.0.0:8079",
+  "readiness_token": "<随机生成一串长字符，如 openssl rand -hex 24>",
+  "readiness_trigger_auto": true
 }

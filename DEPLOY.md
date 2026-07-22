@@ -10,7 +10,7 @@
 
 1. **刷新 token**：若 config 里填了 `refresh_token`，自动换新 access token 并写回 config；没有就沿用静态 token。
 2. **抓数据**：PMC（CTL/ATL/TSB）+ 近 30 天骑行记录。
-3. **教练生成计划**：glm-5.2 基于最新数据生成**从今天起 14 天**的计划（含 IF/TSS/区间）。失败自动重试 3 次。
+3. **教练生成计划**：glm-5.2 基于最新数据生成**从今天起 14 天**的计划（含 IF/TSS/区间）。失败自动重试（`--retries` 默认 12 次）。
 4. **删旧计划**：删除日历上所有 ≥ 今天、名字带「（计划）」后缀的旧课。**只动脚本自己导入的课**，你手动建的课、历史课一律不动。
 5. **写入新计划**：按新课表创建训练课并排到对应日期（休息日跳过）。
 6. **推送微信**：经 Server酱 把报告推到你微信。
@@ -26,9 +26,11 @@
 
 ```
 /opt/onelap-train/
-├── onelap_report.py      # 主程序
-├── config.json           # 配置（token / refresh_token / 三个 key）
-└── logs/                 # 运行日志（程序自动创建）
+├── onelap_report.py        # 主程序
+├── readiness_server.py     # （可选）健康数据接收端
+├── config.json             # 配置（token / 三个 key / coach_profile / readiness_*）
+├── readiness.json          # （可选）当日 readiness，由 iPhone 快捷指令写入
+└── logs/                   # 运行日志（程序自动创建）
 ```
 
 > 把本机的 `onelap_report.py` 上传到服务器；`config.json` 在服务器上新建（见第 3 步），**不要**把本机含密钥的 config.json 直接传公网。
@@ -162,6 +164,95 @@ schtasks /delete /tn "OnelapAuto" /f    # 删除
 
 ---
 
+## 5C. （可选）Apple Watch 健康数据 → readiness.json
+
+让 AI 教练「当天」就感知你的睡眠 / HRV / 静息心率：iPhone「快捷指令」每天早晨醒来时，把 Apple Watch 的健康数据 POST 到服务器上的轻量接收端 `readiness_server.py`，写成 `readiness.json` 并累积进历史基线；可选在数据到达后**自动重跑一次 `--auto`**（醒来 → 计划刷新 → 推送）。
+
+> Apple Watch 健康数据锁在设备里，没有官方远程 API。本方案用 iPhone「快捷指令」读「健康」App，是无需第三方 App、最轻量的路径。纯标准库，无需 pip 安装。
+
+### 1) 服务器端：配 config + 跑接收端
+
+`config.json` 加三项（参考 `config.example.json`）：
+
+```json
+"readiness_listen": "0.0.0.0:8079",
+"readiness_token": "<随机长串：openssl rand -hex 24>",
+"readiness_trigger_auto": true
+```
+
+- `readiness_token` 是鉴权密钥，**自己生成一串随机字符**；快捷指令 POST 时必须带上，否则 401。
+- `readiness_listen` 监听地址：对外收数据用 `0.0.0.0:端口`，并在防火墙放行该端口（如 `firewall-cmd --add-port=8079/tcp`）。
+- `readiness_trigger_auto=true`：每次有效写入后（按日期去重）后台触发一次 `onelap_report.py --auto`。
+
+跑起来（二选一）：
+
+```bash
+# 方式 A：nohup（简单，重启后需手动再起）
+cd /opt/onelap-train
+nohup python3 readiness_server.py > logs/readiness_server.log 2>&1 &
+
+# 方式 B：systemd（推荐，开机自启 + 崩溃重启）
+sudo tee /etc/systemd/system/onelap-readiness.service >/dev/null <<'EOF'
+[Unit]
+Description=Onelap readiness receiver
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/onelap-train
+ExecStart=/usr/bin/python3 /opt/onelap-train/readiness_server.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload && sudo systemctl enable --now onelap-readiness
+sudo systemctl status onelap-readiness     # 看 Active: active (running)
+```
+
+先 curl 自测（把 TOKEN / IP 换成你的）：
+
+```bash
+curl -X POST http://你的服务器IP:8079/readiness \
+  -H "Authorization: Bearer 你的readiness_token" \
+  -H "Content-Type: application/json" \
+  -d '{"sleep_h":7.2,"hrv_ms":58,"rhr_bpm":52,"subjective":7}'
+# 预期：{"ok":true,"readiness":{...},"score":{"score":77,"advice":"黄灯..."},"triggered_auto":true}
+```
+
+> **强烈建议走 HTTPS**：健康数据 + token 走明文 HTTP 有被窃听风险。最省事是拿个域名用 Caddy 反代（自动证书）：
+> `caddy reverse-proxy --from health.你的域名 --to :8079`，之后快捷指令 POST 到 `https://health.你的域名/readiness`。
+
+### 2) iPhone 端：建「快捷指令」
+
+「快捷指令」App 新建快捷指令，依次加动作：
+
+1. **查找健康样本**（Find Health Samples）——首次会请求「健康」读取权限，允许：
+   - 类型 **睡眠**（Sleep Analysis）→ 时间范围「昨天到今天」→ 打开「合计」→ 得睡眠总**分钟**数，后面 ÷60 得 `sleep_h`；
+   - 类型 **心率变异性**（Heart Rate Variability, SDNN）→「最新一条」「今天」→ `hrv_ms`；
+   - 类型 **静息心率**（Resting Heart Rate）→「最新一条」「今天」→ `rhr_bpm`。
+2. **要求输入数字**：标题「主观恢复几分？(1-10)」→ `subjective`。（嫌烦可省略，服务器用其余字段照常算分。）
+3. **字典**（Dictionary）拼成：
+   ```json
+   {"sleep_h": <睡眠小时>, "hrv_ms": <HRV>, "rhr_bpm": <静息>, "subjective": <主观>}
+   ```
+4. **获取 URL 内容**（Get Contents of URL）：
+   - URL：`https://health.你的域名/readiness`（走反代）或 `http://你的服务器IP:8079/readiness`
+   - 方法：**POST**
+   - Headers：`Authorization` = `Bearer 你的readiness_token`；`Content-Type` = `application/json`
+   - Body 选「JSON / 文件」，传入上一步字典。
+   - 返回里有 `score`，可接「显示结果」把分数显示出来。
+
+### 3) 设为每天自动跑
+
+「自动化」App → 新建个人自动化 → 触发选**「特定时间」**（如每天 7:00）或**「闹钟停止后」** → 操作「运行快捷指令」选上面这条 → 关闭「运行前询问」。
+
+醒来一跑：数据落盘 →（若开了 `readiness_trigger_auto`）计划立刻用当天 readiness 重生成并推微信。
+
+> **和凌晨 cron 的关系**：开了 `readiness_trigger_auto` 后，4 点那条 cron 可当「保险」（某天没带表/没 POST 时兜底）；不开 trigger_auto 的话，建议把 cron 改到早晨快捷指令**之后**（如 7:30），否则 4 点跑时还没有当天 readiness。
+
+---
+
 ## 6. 日志与日常监控
 
 ```bash
@@ -194,7 +285,7 @@ EOF
 |---|---|
 | `认证失败（HTTP 401）` / `token 刷新失败` | access token 过期且没 refresh_token（或 refresh_token 也过期）。重新登录 OTM，更新 config 里的 `token`（和 `refresh_token`）。 |
 | token 每两天就过期 | 没填 `refresh_token` 或 OTM 该登录方式不发。只能定期手动更新 token（见第 2 步重新拿）。填了 refresh_token 则脚本自动续、长期免维护。 |
-| `教练调用失败 … 改用兜底说明` / 计划没生成 | glm-5.2 接口超时或余额不足（1113=余额不足，1211=模型名错）。`--auto` 已重试 3 次；查余额/换时段/重跑即可。 |
+| `教练调用失败 … 改用兜底说明` / 计划没生成 | glm-5.2 接口超时或余额不足（1113=余额不足，1211=模型名错）。`--auto` 默认重试 12 次（`--retries` 可调）；查余额/换时段/重跑即可。 |
 | 微信没收到 | `serverchan_key` 没填或失效；或 Server酱 推送频率限制。看日志里 `微信推送失败` 行。 |
 | 日历没更新 / 重复课 | 看 `导入完成：成功 N/14`；失败看 `[FAIL]` 行。重复课一般是被手动跑过两次——`--auto` 每次先删旧「（计划）」课再重建，正常不会重复。 |
 | cron 没跑 | `python3` 没用绝对路径；或时区不对；或目录不可写。手动 `cd ... && python3 onelap_report.py --auto` 复现。 |
@@ -231,6 +322,6 @@ python3 -c "import onelap_report as R,json; c=R.load_config(); c,_=R.refresh_acc
 ## 9. 已知限制
 
 - **token 依赖 refresh_token 续期**：没有 refresh_token 时每 ~48 小时要手动更新一次 token（OTM 的限制，不是脚本问题）。
-- **计划由 LLM 生成**：glm-5.2 每次输出会有细微差异（正常），核心区间/TSS 稳定；偶发接口超时会自动重试 3 次。
+- **计划由 LLM 生成**：glm-5.2 每次输出会有细微差异（正常），核心区间/TSS 稳定；偶发接口超时会自动重试（默认 12 次）。
 - **只管理「（计划）」后缀的课**：脚本绝不删除你手动建或官方套用的训练课。
 - 服务器需能访问 `otm.onelap.cn`、`open.bigmodel.cn`、`sctapi.ftqq.com`（都在国内，一般无障碍）。

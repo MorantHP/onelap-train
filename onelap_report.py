@@ -374,49 +374,211 @@ def tsb_interp(tsb):
 # glm-5.2 教练：把历史训练数据交给 LLM（角色=自行车教练）生成未来计划
 # ---------------------------------------------------------------------------
 SYSTEM_COACH = (
-    "你是一位资深的自行车教练，精通功率训练与 PMC 模型："
-    "CTL≈长期体能（约42天加权），ATL≈短期疲劳（约7天加权），TSB=CTL−ATL 反映当前状态"
-    "（>5 清爽、−10~5 中性、<−10 疲劳、<−30 严重疲劳）。"
-    "你会根据车手最近的训练负荷、强度与疲劳状态，制定科学且可执行的计划。"
-    "原则：疲劳高时优先恢复与睡眠；强度日与恢复/休息日交替；周末可安排长距离；循序渐进避免过载。"
+    "你是一位资深自行车教练兼运动营养师，精通功率训练、PMC 模型与周期化："
+    "CTL≈长期体能(约42天加权)，ATL≈短期疲劳(约7天加权)，TSB=CTL−ATL（>5清爽、−10~5中性、<−10疲劳、<−30严重疲劳）。"
+    "你会综合车手的【个人档案与目标、当日 readiness(睡眠/HRV/静息心率)、可训练时间窗、季节与阶段、近期训练负荷】，"
+    "制定科学且【能在真实时间窗内执行】的计划，并给配套饮食建议。"
+    "铁律：疲劳高或 readiness 差时优先恢复与睡眠；强度日与恢复日交替；循序渐进绝不堆量过载（别让 TSB 长期 <−20）。"
     "用中文回答，语气专业、简洁、可直接照做。"
 )
 
 
-def build_coach_prompt(pmc, rides, today, days_ahead, start_date=None):
+def season_hint(today):
+    """按北京气候给季节阶段提示（冬训室内 / 转户外 / 赛季 / 过渡）。"""
+    m = today.month
+    if m in (11, 12, 1, 2):
+        return "冬训·室内骑行台（北京户外不宜）"
+    if m in (3, 4):
+        return "转户外 + 巅峰期"
+    if m in (5, 6, 7, 8, 9):
+        return "赛季·户外"
+    return "赛季末 + 过渡"
+
+
+def load_readiness():
+    """读 readiness.json（由 Apple Watch 捷径每日写入：sleep_h/hrv_ms/rhr_bpm/subjective/date）。无则 None。"""
+    p = os.path.join(HERE, "readiness.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return None
+
+
+READINESS_HISTORY = os.path.join(HERE, "readiness_history.jsonl")
+
+
+def _read_readiness_history():
+    """读 readiness_history.jsonl，按 date 去重（保留最新一条），按日期升序返回。"""
+    if not os.path.exists(READINESS_HISTORY):
+        return []
+    by_date = {}
+    try:
+        with open(READINESS_HISTORY, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                d = rec.get("date")
+                if d:
+                    by_date[d] = rec
+    except Exception:
+        return []
+    return [by_date[k] for k in sorted(by_date)]
+
+
+def append_readiness_history(rd):
+    """把当日 readiness 追加进历史（按 date 去重保留最新），供算个人基线。无 date 则跳过。幂等。"""
+    if not rd or not rd.get("date"):
+        return
+    keep = [r for r in _read_readiness_history() if r.get("date") != rd["date"]]
+    keep.append({k: rd.get(k) for k in ("date", "sleep_h", "hrv_ms", "rhr_bpm", "subjective")})
+    keep.sort(key=lambda r: r.get("date", ""))
+    try:
+        with open(READINESS_HISTORY, "w", encoding="utf-8") as f:
+            for r in keep:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def readiness_baseline(today=None, window=7):
+    """返回近期（默认最近 window 天，含今日）HRV/静息心率/睡眠 的滚动均值作为个人基线。样本不足返回 None。"""
+    recs = _read_readiness_history()
+    if today is not None:
+        iso = today.isoformat() if hasattr(today, "isoformat") else str(today)
+        recs = [r for r in recs if r.get("date") and r["date"] < iso]  # 基线只取【今天之前】的常态
+    recs = recs[-window:]
+
+    def avg(key):
+        vals = [r.get(key) for r in recs if isinstance(r.get(key), (int, float))]
+        return sum(vals) / len(vals) if vals else None
+
+    hrv, rhr, slp = avg("hrv_ms"), avg("rhr_bpm"), avg("sleep_h")
+    if hrv is None and rhr is None:
+        return None
+    return {"hrv_ms": hrv, "rhr_bpm": rhr, "sleep_h": slp, "n": len(recs)}
+
+
+def readiness_score(rd, baseline=None):
+    """综合 readiness 打分 0-100（绿≥80 / 黄 65-79 / 橙 50-64 / 红<50）。
+    睡眠、主观用绝对值；HRV、静息心率相对【个人滚动基线】评判（无基线则不计入、权重重归一）。
+    这样没基线时也不会被"未知"拉低分数。无任何可用数据返回 None。"""
+    if not rd:
+        return None
+    parts = []  # [(score 0-100, weight)]
+
+    slp = rd.get("sleep_h")
+    if isinstance(slp, (int, float)):
+        s = 95 if slp >= 8 else 82 if slp >= 7 else 66 if slp >= 6 else 48 if slp >= 5 else 28
+        parts.append((s, 0.30))
+
+    sub = rd.get("subjective")
+    if isinstance(sub, (int, float)):
+        parts.append((max(0, min(100, sub * 10)), 0.25))
+
+    hrv, b_hrv = rd.get("hrv_ms"), (baseline.get("hrv_ms") if baseline else None)
+    if isinstance(hrv, (int, float)) and isinstance(b_hrv, (int, float)) and b_hrv > 0:
+        s = 60 + (hrv - b_hrv) / b_hrv * 200  # 持平基线=60；高 10%→80；低 10%→40
+        parts.append((max(0, min(100, s)), 0.25))
+
+    rhr, b_rhr = rd.get("rhr_bpm"), (baseline.get("rhr_bpm") if baseline else None)
+    if isinstance(rhr, (int, float)) and isinstance(b_rhr, (int, float)) and b_rhr > 0:
+        s = 60 - (rhr - b_rhr) * 7  # 持平基线=60；高 3bpm→39；低 3bpm→81
+        parts.append((max(0, min(100, s)), 0.20))
+
+    if not parts:
+        return None
+    wsum = sum(s * w for s, w in parts)
+    tw = sum(w for _, w in parts)
+    score = round(wsum / tw) if tw else 50
+    if score >= 80:
+        advice = "绿灯·可按计划上强度"
+    elif score >= 65:
+        advice = "黄灯·强度略降 10-15%，保时长"
+    elif score >= 50:
+        advice = "橙灯·以 Z2/恢复为主，跳过 VO2/阈值"
+    else:
+        advice = "红灯·优先恢复/休息，勿上强度"
+    return {"score": score, "advice": advice}
+
+
+def readiness_flag(rd, baseline=None):
+    """把 readiness 数值 + 综合分翻译成一句人话提示（喂给教练）。"""
+    if not rd:
+        return "（今日无 readiness 数据，按计划与体感执行）"
+    bits = []
+    if rd.get("sleep_h") is not None: bits.append(f"睡眠 {rd['sleep_h']}h")
+    if rd.get("hrv_ms") is not None: bits.append(f"HRV {rd['hrv_ms']}ms")
+    if rd.get("rhr_bpm") is not None: bits.append(f"静息心率 {rd['rhr_bpm']}")
+    if rd.get("subjective") is not None: bits.append(f"主观 {rd['subjective']}/10")
+    sc = readiness_score(rd, baseline)
+    score_txt = f"；readiness {sc['score']}/100（{sc['advice']}）" if sc else ""
+    return f"（{'、'.join(bits)}{score_txt}）"
+
+
+def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None):
     if start_date is None:
         start_date = today + timedelta(days=1)  # 默认从明天起；--auto 从今天起
+    prof = cfg.get("coach_profile") or {}
+    sched = prof.get("schedule") or {}
     past = [x for x in pmc if x[0] <= today]
     latest = past[-1] if past else None
     _d, ctl, atl, tsb, _tss = latest if latest else (None, None, None, None, None)
     recent = [r for r in rides if (today - timedelta(days=13)) <= r["date"] <= today]
+    w = prof.get("weight_kg") or 79
 
-    u = [f"今天是 {today.isoformat()}（{weekday_cn(today)}）。以下是这位车手的真实训练数据：", ""]
-    u.append("**【当前体能状态 PMC】**")
-    u.append(f"- CTL（体能）={fmt_num(ctl,1)}，ATL（疲劳）={fmt_num(atl,1)}，TSB（状态）={fmt_num(tsb,1)}")
-    if tsb is not None:
-        u.append(f"- 状态解读：{tsb_interp(tsb)}")
+    u = [f"今天是 {today.isoformat()}（{weekday_cn(today)}）。以下是这位车手的真实档案与数据：", ""]
+
+    u.append("**【个人档案 / 目标 / 时间表】**")
+    u.append(f"- 体重 {prof.get('weight_kg','?')}kg，FTP {prof.get('ftp','?')}W，目标：{prof.get('goal','提高FTP')}")
+    u.append(f"- 所在地 {prof.get('location','?')}；季节阶段：{season_hint(today)}；训练阶段：{prof.get('phase','base')}")
+    if sched:
+        u.append(f"- 工作日早窗：{sched.get('weekday_am','?')}")
+        u.append(f"- 工作日晚窗：{sched.get('weekday_pm','?')}")
+        u.append(f"- 周末：{sched.get('weekend','?')}")
+        if sched.get("winter_note"):
+            u.append(f"- 冬季说明：{sched.get('winter_note')}")
     u.append("")
-    u.append(f"**【最近 {len(recent) or 14} 天骑行记录】**（已完成，按时间）")
-    u.append("日期 | TSS | 时长 | 距离 | 均功W | 均心")
+
+    _rd = load_readiness()
+    u.append(f"**【今日 readiness】** {readiness_flag(_rd, readiness_baseline(today))}")
+    u.append("")
+
+    u.append("**【当前体能 PMC】**")
+    u.append(f"- CTL={fmt_num(ctl,1)}，ATL={fmt_num(atl,1)}，TSB={fmt_num(tsb,1)}" +
+             (f"（{tsb_interp(tsb)}）" if tsb is not None else ""))
+    u.append("")
+    u.append(f"**【最近 {len(recent) or 14} 天骑行】** 日期|TSS|时长|距离|均功|均心")
     u.append("---|---|---|---|---|---")
     for r in recent:
-        u.append(f"{r['date'].isoformat()} | {fmt_num(r['tss'],0)} | "
-                 f"{human_duration(r['duration_s'])} | {fmt_num(r['distance_km'],0)}km | "
-                 f"{fmt_num(r['avg_power'],0)} | {fmt_num(r['avg_hr'],0)}")
+        u.append(f"{r['date'].isoformat()}|{fmt_num(r['tss'],0)}|{human_duration(r['duration_s'])}|"
+                 f"{fmt_num(r['distance_km'],0)}km|{fmt_num(r['avg_power'],0)}|{fmt_num(r['avg_hr'],0)}")
     u.append("")
-    u.append(f"请基于以上数据，为**从 {start_date.isoformat()}（{weekday_cn(start_date)}）起未来 {days_ahead} 天**制定训练计划。要求：")
-    u.append("1) 先用 2-3 句给出整体判断：当前状态如何、本周应侧重恢复还是上量、有无过载风险。")
-    u.append("2) 逐日给出计划（Markdown 表格）：日期 | 星期 | 训练/休息 | 课目 | 目标时长 | 目标TSS | 强度IF | 主要目的。休息日也要列出。")
-    u.append("3) 结尾给 2 条注意事项（恢复/营养/需要警惕的信号）。")
-    u.append("4) 最后另起一段，输出一个 ```json 代码块（供程序导入训练系统，必须严格如下格式，不要多余字段、不要注释）：")
+
+    u.append("**【营养目标：减脂增肌】**")
+    u.append(f"- 蛋白 {int(w*1.8)}-{int(w*2.0)}g/天；强度日碳水 5-7g/kg、休息日 3-4g/kg；小幅热量缺口 −300~−400kcal；"
+             f"长骑/强度课途中补碳水 30-60g/h，课后补碳水+蛋白。")
+    u.append("")
+
+    u.append(f"请综合以上，为**从 {start_date.isoformat()}（{weekday_cn(start_date)}）起未来 {days_ahead} 天**制定计划。要求：")
+    u.append("1) 先 2-3 句整体判断（当前状态/本周侧重/过载风险）。")
+    u.append("2) **今日重点**：把今天的训练安排进真实时段（早窗/晚窗/休息），并给今天 1 句饮食提示；若 readiness 偏差则降级为恢复。")
+    u.append("3) 未来逐日计划表：日期|星期|训练/休息|课目|时段|时长|目标TSS|强度IF|主要目的。休息日也列。时段必须符合上面的时间窗（工作日早 ≤8点前到家）。")
+    u.append("4) 营养与恢复各 2 条注意事项。")
+    u.append("5) 最后输出 ```json 代码块（供程序导入，严格如下，无多余字段）：")
     u.append('```json')
-    u.append('{"summary":"整体判断2-3句","notes":["注意1","注意2"],')
-    u.append(' "days":[{"date":"YYYY-MM-DD","action":"train或rest","name":"课目简称",')
+    u.append('{"summary":"整体判断","notes":["注意1","注意2"],')
+    u.append(' "days":[{"date":"YYYY-MM-DD","action":"train或rest","name":"课目",')
     u.append('   "duration_min":120,"tss":70,"if":0.70,"zone":"Z2","purpose":"目的"}]}')
     u.append('```')
-    u.append(f"要求：days 必须覆盖从 {start_date.isoformat()} 起共 {days_ahead} 天、日期连续；action=rest 时 duration_min=0/tss=0/if=0/zone=\"\"；"
-             f"zone 取 Z1/Z2/Z3/Z4/Z5/Z6 或 \"甜区\"；duration_min 单位分钟；if 为 0~1.2 的小数。")
+    u.append(f"要求：days 覆盖 {start_date.isoformat()} 起 {days_ahead} 天、日期连续；action=rest 时 duration_min=0/tss=0/if=0/zone=\"\"；"
+             f"zone 取 Z1/Z2/Z3/Z4/Z5/Z6 或\"甜区\"；if 为 0~1.2 的小数。强度(TSS)循序渐进，勿让 TSB 长期 <−20。")
     return SYSTEM_COACH, "\n".join(u)
 
 
@@ -925,6 +1087,7 @@ def main():
         training_plans = {}
     else:
         cfg = load_config()
+        append_readiness_history(load_readiness())  # 记今日 readiness 进历史，供算个人基线
         if args.auto:
             try:
                 cfg, refreshed = refresh_access_token(cfg)
@@ -961,7 +1124,7 @@ def main():
 
         # glm-5.2 教练生成计划（config.json 里填了 glm_api_key 就启用）
         if not args.no_coach and (cfg.get("glm_api_key") or "").strip():
-            system, user = build_coach_prompt(pmc_items(pmc_raw), rides, today, args.days_ahead,
+            system, user = build_coach_prompt(cfg, pmc_items(pmc_raw), rides, today, args.days_ahead,
                                               start_date=start_date)
             attempts = (args.retries if args.retries and args.retries > 0 else 12) if args.auto else 1
             raw = None
