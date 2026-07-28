@@ -136,12 +136,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
         elif path in ("/readiness/latest", "/readiness"):
             self._send(200, R.load_readiness() or {"readiness": None})
+        elif path in ("/override", "/rest"):
+            self._send(200, {"rest_dates": sorted(R.load_rest_flags())})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path != "/readiness":
+        if path not in ("/readiness", "/override", "/rest"):
             self._send(404, {"error": "not found"})
             return
         if not self._authed():
@@ -152,6 +154,9 @@ class Handler(BaseHTTPRequestHandler):
             obj = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
         except Exception as e:
             self._send(400, {"error": f"bad json: {e}"})
+            return
+        if path in ("/override", "/rest"):
+            self._handle_override(obj)
             return
         ok, data = validate_payload(obj)
         if not ok:
@@ -164,9 +169,44 @@ class Handler(BaseHTTPRequestHandler):
         os.replace(tmp, READINESS_PATH)
         R.append_readiness_history(data)
         triggered = maybe_trigger_auto(self.trigger_auto)
-        sc = R.readiness_score(data, R.readiness_baseline())
+        sc = R.readiness_score(data, R.readiness_baseline(_today_iso()))
         self._send(200, {"ok": True, "readiness": data,
                          "score": sc, "triggered_auto": triggered})
+
+    def _handle_override(self, obj):
+        """POST /override {date, action:rest|clear} → 标记/取消休息日。
+        date 为 today/tomorrow/YYYY-MM-DD（默认 tomorrow）；标记今日会立即删当日计划课。"""
+        if not isinstance(obj, dict):
+            self._send(400, {"error": "body 需为 JSON 对象"})
+            return
+        action = str(obj.get("action", "rest")).lower()
+        if action not in ("rest", "clear"):
+            self._send(400, {"error": "action 应为 rest 或 clear"})
+            return
+        ds = str(obj.get("date") or "tomorrow")
+        today = datetime.date.today()
+        if ds == "today":
+            date_iso = today.isoformat()
+        elif ds in ("tomorrow", ""):
+            date_iso = (today + datetime.timedelta(days=1)).isoformat()
+        else:
+            d = R.parse_date(ds)
+            if not d:
+                self._send(400, {"error": f"date 格式不对：{ds}（YYYY-MM-DD / today / tomorrow）"})
+                return
+            date_iso = d.isoformat()
+        is_rest = R.mark_rest(date_iso, clear=(action == "clear"))
+        cleaned = 0
+        if action == "rest" and date_iso == today.isoformat() and os.path.exists(CONFIG_PATH):
+            try:
+                cfg = R.load_config()
+                cleaned = R.cleanup_plan_on_date(cfg, date_iso)
+            except Exception as e:
+                self._send(200, {"ok": True, "action": action, "date": date_iso, "rest": is_rest,
+                                 "warning": f"已标记但删当日课失败：{e}"})
+                return
+        self._send(200, {"ok": True, "action": action, "date": date_iso, "rest": is_rest,
+                         "cleaned_today": cleaned, "rest_dates": sorted(R.load_rest_flags())})
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))

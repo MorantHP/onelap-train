@@ -10,6 +10,8 @@
   "_报告日期范围_可选": "",
   "days_back": 14,
   "days_ahead": 14,
+  "_plan_refresh_days_可选": "AI 计划降频：每 N 天才重新调教练排课，其余日子复用日历既有计划(省 token)。默认 3。休息日(用 --rest 或 readiness_server 的 /override 标记)无论如何都跳过 AI。",
+  "plan_refresh_days": 3,
 
   "_AI教练_必填glm_api_key才生成计划": "智谱开放平台 key（open.bigmodel.cn）。模型固定 glm-5.2，账户需有 glm-5.2 额度（glm-4-flash 免费但算出的训练强度 IF 不准，不建议）。",
   "glm_api_key": "<在此粘贴你的智谱 glm api key>",
@@ -31,10 +33,21 @@
       "weekend": "可安排长骑",
       "winter_note": "冬天若无法户外，改室内骑行台"
     },
-    "devices": []
+    "devices": [],
+    "target_event": "如：2026-09 某地 150km 骑游，目标完成+享受（填了教练会据此周期化）",
+    "constraints": ["如：长时间爬坡腰疼", "如：长时间平路/下坡颈疼"],
+    "preferences": ["如：喜欢平路巡航和爬坡", "如：喜欢跑步"],
+    "birth_year": 1990,
+    "gender": "男",
+    "height_cm": 175,
+    "_ftp_mhr_lthr_自动同步": "FTP/MHR/LTHR 每次运行从 OTM /api/userinfo 自动同步写回这里(mhr/lthr 字段首次运行后自动出现)，无需手动维护；FTP 在 OTM 做完测试后会自动更新。"
   },
 
   "_readiness接收端_可选": "配 readiness_server.py：iPhone 快捷指令每天早晨把 Apple Watch 健康数据（睡眠/HRV/静息心率/主观）POST 过来。readiness_token=鉴权密钥（自己生成随机串）；readiness_listen=监听地址，服务器部署用 0.0.0.0:端口 并放行防火墙；readiness_trigger_auto=true 时数据一到就自动重跑一次 --auto（醒来即刷新计划+推送）。详见 DEPLOY.md「readiness 接收端」。",
+  "_天气_可选": "北京各区天气（Open-Meteo 免费无 key，无需配置即用）。home_district 填常骑地点锚定当日天气展示（支持逗号分隔多个），脚本内置 南海子公园/戒台寺 坐标，也可填 16 区名（朝阳/海淀/大兴…）。天气仅供你参考（含 UV/风向风速），不参与教练排课。",
+  "home_district": "南海子公园,戒台寺",
+  "_holiday_dates_可选": "节假日列表(YYYY-MM-DD)。这些日期(及每周五)，天气报告会额外展示「周末去哪骑」近/远郊热点。自行维护，如 [\"2026-10-01\",\"2026-10-02\",\"2026-10-03\"]。",
+  "holiday_dates": [],
   "readiness_listen": "0.0.0.0:8079",
   "readiness_token": "<随机生成一串长字符，如 openssl rand -hex 24>",
   "readiness_trigger_auto": true

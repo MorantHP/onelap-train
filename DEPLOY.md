@@ -102,30 +102,24 @@ python3 onelap_report.py --auto
 
 ---
 
-## 5. 第四步：配 cron（每天凌晨 4 点）
+## 5. 第四步：触发方式 = 上传 readiness（**不需要 cron**）
 
-编辑 crontab：
-```bash
-crontab -e
-```
+**默认不装 cron**：每天 `--auto` 由 `readiness_server.py` 在你上传 readiness 时后台触发（`config.json` 的 `readiness_trigger_auto: true`，见 5C）。**没上传 readiness 的日子不跑**——日历保留上次计划、0 token。这和「省 token」机制天然契合。
 
-加一行（路径换成你的；`>> logs/auto.log 2>&1` 把全部输出落盘）：
+> 如果之前装过 cron（旧版本默认装「凌晨 4 点」或「10:00 备份」），手动清掉，否则没传 readiness 也会跑：
+> ```bash
+> crontab -l | grep -v 'onelap_report.py --auto' | crontab -
+> crontab -l   # 确认已无 onelap 行
+> ```
+> （重跑 `deploy.sh` 也会自动清掉。）
 
+**可选备份 cron**（担心某天忘传 readiness 漏跑才装；时区设上海即北京时间）：
 ```cron
-0 4 * * * cd /opt/onelap-train && mkdir -p logs && /usr/bin/python3 onelap_report.py --auto >> logs/auto.log 2>&1
+0 10 * * * cd /opt/onelap-train && mkdir -p logs && /usr/bin/python3 onelap_report.py --auto >> logs/auto.log 2>&1
 ```
+> `--auto` 自带「每日只跑一次」防重复，所以备份 cron 与 readiness 触发同日只会跑一次（先到的触发）。
 
-> `python3` 路径用 `which python3` 确认，写绝对路径（cron 的 PATH 很小，别只写 `python3`）。
-
-**时区**：cron 用服务器系统时区。要跑「北京时间 4:00」：
-- 推荐：把服务器时区设成上海 → `sudo timedatectl set-timezone Asia/Shanghai`，上面 `0 4 * * *` 即北京 4:00。
-- 不改系统时区的话：在 crontab 顶部加 `CRON_TZ=Asia/Shanghai`，或用 UTC 时间换算（北京 4:00 = UTC 20:00 前一天 → `0 20 * * *`）。
-
-确认已生效：
-```bash
-crontab -l                       # 能看到那行
-systemctl status cron            # Debian/Ubuntu；CentOS 是 crond
-```
+确认触发链路：上传一次 readiness（5C 的 curl 或快捷指令）→ `tail -f logs/auto.log` 应看到 `==== 自动运行开始 ====`。
 
 ---
 
@@ -249,7 +243,40 @@ curl -X POST http://你的服务器IP:8079/readiness \
 
 醒来一跑：数据落盘 →（若开了 `readiness_trigger_auto`）计划立刻用当天 readiness 重生成并推微信。
 
-> **和凌晨 cron 的关系**：开了 `readiness_trigger_auto` 后，4 点那条 cron 可当「保险」（某天没带表/没 POST 时兜底）；不开 trigger_auto 的话，建议把 cron 改到早晨快捷指令**之后**（如 7:30），否则 4 点跑时还没有当天 readiness。
+> **触发关系**：默认**不装 cron**，`--auto` 只在 readiness 上传时触发（没上传就不跑、0 token）。想要「忘传也兜底」才装备份 cron（见第 5 步）——`--auto` 的「每日只跑一次」会保证备份 cron 与 readiness 触发同日不重复。
+
+### 3) 一键「休息日」（省 token）：`POST /override`
+
+同一个 `readiness_server.py` 还提供 `/override` 端点，标记某日为休息日后，该日 `--auto` **完全不调 AI**、并移除当日计划课（0 token）。
+
+```bash
+# 标记明天休息（默认 action=rest, date=tomorrow）
+curl -X POST http://你的服务器IP:8079/override \
+  -H "Authorization: Bearer 你的readiness_token" \
+  -H "Content-Type: application/json" \
+  -d '{"date":"tomorrow","action":"rest"}'
+# → {"ok":true,"date":"2026-07-24","rest":true,"cleaned_today":0,"rest_dates":["2026-07-24"]}
+
+# 标记今天休息（会立即删掉今天的计划课）
+curl -X POST .../override -H "Authorization: Bearer TOKEN" -d '{"date":"today","action":"rest"}'
+
+# 取消
+curl -X POST .../override -H "Authorization: Bearer TOKEN" -d '{"date":"2026-07-24","action":"clear"}'
+
+# 查看当前休息日（GET，只读）
+curl -H "Authorization: Bearer TOKEN" http://你的服务器IP:8079/override
+```
+
+iPhone「快捷指令」同理建一条：「URL = …/override，方法 POST，Headers 带 Bearer token，Body `{"date":"tomorrow","action":"rest"}`」，加到桌面/ Siri 即可一键标记休息。
+
+> 也可纯命令行：`python3 onelap_report.py --rest`（标明天）/ `--rest today` / `--rest-clear all`。
+> 配合 `config.json` 的 `plan_refresh_days`（默认 3）降频复用，日常 token 消耗可降 60%+。
+
+---
+
+## 5D. 省 token：降频复用 + 休息日跳过
+
+见上「一键休息日」与 README「省 token」章节。要点：`--auto` 每 `plan_refresh_days`（默认 3）天才调一次教练重排，其余日子复用日历既有计划；休息日（标记后）0 token。优先级：休息日 > 到期再生 > 复用。
 
 ---
 

@@ -23,7 +23,9 @@ Onelap OTM 训练分析报告
 """
 
 import argparse
+import atexit
 import json
+import math
 import os
 import re
 import ssl
@@ -34,6 +36,14 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+
+# 图表（飞书卡片用）：Pillow 可选——装了才出图，没装退回文字执行率段（核心仍纯标准库）
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
 
 # Windows 控制台默认 GBK，打印中文会报错；强制 stdout/stderr 用 UTF-8。
 for _stream in (sys.stdout, sys.stderr):
@@ -61,7 +71,8 @@ def _urlopen(req, timeout):
         return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", e)
-        is_cert = isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE" in str(reason)
+        _CertErr = getattr(ssl, "SSLCertVerificationError", None)  # Python 3.7.3+ 才有；3.6 取不到
+        is_cert = (_CertErr is not None and isinstance(reason, _CertErr)) or "CERTIFICATE" in str(reason)
         if not is_cert:
             raise
         global _SSL_WARNED
@@ -80,9 +91,46 @@ EP_WORKOUT_CREATE = "/api/otm/calendar/workout"      # POST 创建训练课 → 
 EP_WORKOUT_PLAN = "/api/otm/calendar/workout/plan"   # POST 把课排到日期
 EP_RIDE_LIST = "/api/otm/ride_record/list"         # POST {startTime,end_time}  → 实际骑行记录
 EP_TRAINING_PLANS = "/api/otm/training/plans"      # GET
+EP_USERINFO = "/api/userinfo"                       # GET → 账号 FTP/MHR/LTHR/体重（自动同步用）
 
 # AI 教练固定使用 glm-5.2（不可切换）
 COACH_MODEL = "glm-5.2"
+
+
+# ---------------------------------------------------------------------------
+# --auto 崩溃兜底：未捕获异常退出时推送告警 + 清 readiness 触发锁（保证无人值守可见、可重试）
+#
+# 契约（main ↔ atexit）：_AUTO_CRASH_CTX 是两者唯一的通信通道。
+#   - main() 进入 --auto 时置 auto=True/today；正常完成或「今日已跑过」跳过时置 done=True；
+#     拿到 cfg 后回填 ctx['cfg'] 供告警推送用。
+#   - _auto_crash_handler 在进程退出时检查：仅当 auto 且未 done（=中途崩溃/被中断）才告警 + 清锁。
+#   - 正常结束后清空 ctx['cfg']，避免引用驻留。
+# 用模块级可变 holder 是因为 atexit 回调拿不到运行期才确定的 cfg——这是该约束下的惯用法。
+# ---------------------------------------------------------------------------
+_AUTO_CRASH_CTX = {"auto": False, "done": False, "today": None, "cfg": {}}
+
+
+def _auto_crash_handler():
+    """进程退出时（atexit）兜底：--auto 未正常完成则推送告警、清当日 readiness 触发锁。
+    正常完成会在写 last_auto_run.txt 时把 done 置 True，本函数即跳过；故仅在「中途崩溃/被中断」时触发。"""
+    ctx = _AUTO_CRASH_CTX
+    if not ctx.get("auto") or ctx.get("done"):
+        return
+    cfg = ctx.get("cfg") or {}
+    try:
+        push_alert(cfg, "⚠️ OTM 自动教练未完成",
+                   f"--auto 在 {ctx.get('today')} 未能正常跑完（可能抛异常或被中断），"
+                   f"计划可能未生成/未导入。今日未标记完成 → 备份 cron 会重试；"
+                   f"已清除 readiness 触发锁 → iPhone 捷径重传也会重试。详见 logs/auto.log。")
+    except Exception:
+        pass
+    try:
+        os.remove(os.path.join(HERE, ".readiness_last_trigger"))
+    except OSError:
+        pass
+
+
+atexit.register(_auto_crash_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +287,39 @@ def get_training_plans(cfg):
         return {}
 
 
+def get_userinfo(cfg):
+    """GET /api/userinfo → 账号生理数据(FTP/MHR/LTHR/体重)。只读，失败返回 None。"""
+    try:
+        return api_request(cfg, EP_USERINFO, "GET")
+    except ApiError as e:
+        log(f"OTM userinfo 获取失败: {e}")
+        return None
+
+
+def sync_physiology_from_otm(cfg, info):
+    """用 userinfo 更新 coach_profile 的 ftp/mhr/lthr/体重；有变化才原子写回 config。
+    返回是否有改动。字段名容错（多候选 key）；取不到会打印可用 keys 便于排查。"""
+    if not isinstance(info, dict):
+        return False
+    prof = cfg.setdefault("coach_profile", {})
+    ftp = to_num(first(info, "ftp", "FTP", "ftp_w", "ftp_value"))
+    mhr = to_num(first(info, "max_heart_rate", "maxHeartRate", "mhr", "MHR", "max_heart_rate_bpm", "max_hr"))
+    lthr = to_num(first(info, "lthr", "LTHR", "lactate_threshold_hr", "lt_hr"))
+    changed = False
+    if ftp and ftp != to_num(prof.get("ftp")):
+        prof["ftp"] = int(round(ftp)); changed = True
+    if mhr and mhr != to_num(prof.get("mhr")):
+        prof["mhr"] = int(round(mhr)); changed = True
+    if lthr and lthr != to_num(prof.get("lthr")):
+        prof["lthr"] = int(round(lthr)); changed = True
+    if changed:
+        save_config(cfg)
+        log(f"OTM 生理数据已同步写回 config：FTP={prof.get('ftp')} MHR={prof.get('mhr')} LTHR={prof.get('lthr')}")
+    elif ftp is None and mhr is None and lthr is None:
+        log(f"userinfo 未识别出生理字段，可用 keys: {list(info.keys())}")
+    return changed
+
+
 # ---------------------------------------------------------------------------
 # 字段容错提取
 # ---------------------------------------------------------------------------
@@ -371,28 +452,515 @@ def tsb_interp(tsb):
 
 
 # ---------------------------------------------------------------------------
+# 天气（Open-Meteo，免费无 key）：北京 16 区 + 常骑地点 → 当日天气 + AQI + 户外适宜度
+#   预报 https://api.open-meteo.com/v1/forecast（daily+hourly+current）
+#   空气 https://air-quality-api.open-meteo.com/v1/air-quality?current=us_aqi,pm2_5,pm10
+#   16 区 + 常骑点并发抓（ThreadPoolExecutor），复用 _urlopen 的 SSL 容错。
+#   天气是可降级的增强项：全链路失败→None→报告省略天气章节、教练 prompt 不带天气，绝不阻断主流程。
+# ---------------------------------------------------------------------------
+# 北京 16 区中心经纬度（name, lat, lon, group）
+BEIJING_DISTRICTS = [
+    ("东城", 39.93, 116.41, "城六区"), ("西城", 39.91, 116.36, "城六区"),
+    ("朝阳", 39.92, 116.44, "城六区"), ("海淀", 39.96, 116.29, "城六区"),
+    ("丰台", 39.85, 116.28, "城六区"), ("石景山", 39.90, 116.22, "城六区"),
+    ("门头沟", 39.93, 116.10, "近郊"), ("房山", 39.72, 116.14, "近郊"),
+    ("通州", 39.91, 116.65, "近郊"), ("顺义", 40.13, 116.65, "近郊"),
+    ("昌平", 40.22, 116.23, "近郊"), ("大兴", 39.72, 116.33, "近郊"),
+    ("怀柔", 40.32, 116.63, "远郊山区"), ("平谷", 40.14, 117.11, "远郊山区"),
+    ("密云", 40.37, 116.83, "远郊山区"), ("延庆", 40.46, 115.97, "远郊山区"),
+]
+_DISTRICT_COORDS = {n: (la, lo) for n, la, lo, _ in BEIJING_DISTRICTS}
+
+# 常骑地点精确坐标（home_district 优先从此解析，逗号分隔可多个）。
+# 南海子公园实际位于大兴/亦庄一带；戒台寺在门头沟（经典爬坡）。
+RIDING_SPOTS = {
+    "南海子公园": (39.76, 116.50),
+    "戒台寺": (39.97, 116.09),
+}
+
+# 默认只抓今天 + 明天两天（远期预报不准，按用户要求精简）
+WEATHER_FORECAST_DAYS = 2
+
+# 「周末去哪骑」候选（近/远郊热门骑行地）——仅周五 / 节假日(config.holiday_dates)触发时展示
+WEEKEND_DESTINATIONS = ["门头沟", "昌平", "怀柔", "延庆", "密云", "平谷", "房山", "顺义", "大兴", "通州"]
+
+# Open-Meteo WMO weather_code → 中文（白天语义，够用）
+_WMO = {
+    0: "晴", 1: "晴间多云", 2: "多云", 3: "阴",
+    45: "雾", 48: "冻雾",
+    51: "毛毛雨", 53: "小雨", 55: "中雨", 56: "冻毛雨", 57: "冻雨",
+    61: "小雨", 63: "中雨", 65: "大雨", 66: "冻雨", 67: "冻雨",
+    71: "小雪", 73: "中雪", 75: "大雪", 77: "霰",
+    80: "阵雨", 81: "中阵雨", 82: "强阵雨", 85: "阵雪", 86: "阵雪",
+    95: "雷阵雨", 96: "雷阵雨冰雹", 99: "强雷阵雨冰雹",
+}
+
+_OM_FORECAST = "https://api.open-meteo.com/v1/forecast"
+_OM_AQI = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+# daily 列 → 规整键
+_WCOLKEY = {"temperature_2m_max": "tmax", "temperature_2m_min": "tmin",
+            "apparent_temperature_max": "apparent_max",
+            "precipitation_probability_max": "precip_prob",
+            "wind_speed_10m_max": "wind_max", "wind_direction_10m_dominant": "wind_dir",
+            "uv_index_max": "uv", "weather_code": "weather_code"}
+_WCOLS = list(_WCOLKEY.keys())
+
+
+def wmo_desc(code):
+    try:
+        return _WMO.get(int(code), "—")
+    except (TypeError, ValueError):
+        return "—"
+
+
+def aqi_level(us_aqi):
+    """US AQI → 中文等级。None → '—'。"""
+    if us_aqi is None:
+        return "—"
+    a = us_aqi
+    if a <= 50: return "优"
+    if a <= 100: return "良"
+    if a <= 150: return "轻度污染"
+    if a <= 200: return "中度污染"
+    if a <= 300: return "重度污染"
+    return "严重污染"
+
+
+def deg_to_dir(deg):
+    """风向度数 → 8 方位中文（风从哪吹来）。None → '—'。"""
+    if deg is None:
+        return "—"
+    try:
+        d = float(deg) % 360
+    except (TypeError, ValueError):
+        return "—"
+    dirs = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+    return dirs[int((d + 22.5) // 45) % 8]
+
+
+def uv_level(uv):
+    """UV 指数 → 等级（WHO）。None → '—'。"""
+    if uv is None:
+        return "—"
+    u = uv
+    if u < 3: return "弱"
+    if u < 6: return "中等"
+    if u < 8: return "强"
+    if u < 11: return "很强"
+    return "极强"
+
+
+_TAG_ORDER = {"不宜户外": 0, "注意": 1, "宜": 2}
+
+
+def _worst_tag(tags):
+    """多个 tag 取最保守（最差）。无有效值返回 '—'。"""
+    valid = [t for t in tags if t in _TAG_ORDER]
+    return min(valid, key=lambda t: _TAG_ORDER[t]) if valid else "—"
+
+
+def weather_suitability(apparent_max, precip_prob, wind_max, aqi, weather_code=None):
+    """规则判定【户外骑行】适宜度 → (tag, reasons[])。tag ∈ 宜/注意/不宜户外。阈值透明可解释。
+    注：aqi 仅有实时值（无逐日预报），未来日评估时传 None（只看温/雨/风/恶劣天气码）。"""
+    reasons, level = [], 0
+    # 恶劣天气码（雷电/冰雹/大雨=不宜；中雨/雪=注意）——对骑行是硬性危险，不仅看降水概率
+    try:
+        wc = int(weather_code) if weather_code is not None else None
+    except (TypeError, ValueError):
+        wc = None
+    if wc is not None:
+        if wc in (65, 82, 95, 96, 99):  # 大雨/强阵雨/雷阵雨/雷阵雨冰雹
+            reasons.append(wmo_desc(wc)); level = 2
+        elif wc in (63, 81, 71, 73, 75, 77, 85, 86):  # 中雨/中阵雨/雪
+            reasons.append(wmo_desc(wc)); level = max(level, 1)
+    if aqi is not None:
+        if aqi > 200:
+            reasons.append(f"AQI{aqi:.0f}重度污染"); level = 2
+        elif aqi > 150:
+            reasons.append(f"AQI{aqi:.0f}不健康"); level = 2
+        elif aqi > 100:
+            reasons.append(f"AQI{aqi:.0f}轻度污染"); level = max(level, 1)
+    if apparent_max is not None:
+        if apparent_max >= 38:
+            reasons.append(f"体感{apparent_max:.0f}℃热射病风险"); level = 2
+        elif apparent_max >= 35:
+            reasons.append(f"体感{apparent_max:.0f}℃高温"); level = max(level, 1)
+    if precip_prob is not None:
+        if precip_prob >= 70:
+            reasons.append(f"降水{precip_prob:.0f}%"); level = 2
+        elif precip_prob >= 50:
+            reasons.append(f"降水{precip_prob:.0f}%"); level = max(level, 1)
+    if wind_max is not None:
+        if wind_max >= 40:
+            reasons.append(f"风{wind_max:.0f}km/h"); level = 2
+        elif wind_max >= 30:
+            reasons.append(f"风{wind_max:.0f}km/h"); level = max(level, 1)
+    return ["宜", "注意", "不宜户外"][level], reasons
+
+
+def _om_get(url, timeout=20):
+    """GET Open-Meteo JSON。失败返回 None（天气是可降级的增强项，绝不抛）。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "onelap-train/1.0"})
+    try:
+        with _urlopen(req, timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _fetch_point(name, lat, lon, group, days):
+    """抓一个点（区/常骑点）的当日预报(逐日+逐时) + 实时AQI → 规整 dict 或 None。"""
+    days = max(1, min(int(days or 1), 16))
+    daily_v = ",".join(_WCOLS)
+    hourly_v = "temperature_2m,apparent_temperature,precipitation_probability,wind_speed_10m,wind_direction_10m,uv_index,weather_code"
+    fc = _om_get(f"{_OM_FORECAST}?latitude={lat}&longitude={lon}&daily={daily_v}&hourly={hourly_v}"
+                 f"&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,precipitation,weather_code"
+                 f"&timezone=Asia/Shanghai&forecast_days={days}")
+    if not fc or not isinstance(fc.get("daily"), dict):
+        return None
+    d = fc["daily"]
+    times = d.get("time") or []
+    daily = []
+    for i, t in enumerate(times):
+        rec = {"date": t}
+        for c in _WCOLS:
+            arr = d.get(c) or []
+            rec[_WCOLKEY[c]] = arr[i] if i < len(arr) else None
+        daily.append(rec)
+    if not daily:
+        return None
+    today = daily[0]
+
+    a = _om_get(f"{_OM_AQI}?latitude={lat}&longitude={lon}&current=us_aqi,pm2_5,pm10&timezone=Asia/Shanghai")
+    aqi = None
+    if a and isinstance(a.get("current"), dict):
+        aqi = {k: a["current"].get(k) for k in ("us_aqi", "pm2_5", "pm10")}
+
+    h = fc.get("hourly") or {}
+    ht = h.get("time") or []
+    hkeys = ["temperature_2m", "apparent_temperature", "precipitation_probability",
+             "wind_speed_10m", "wind_direction_10m", "uv_index", "weather_code"]
+    hcols = {k: (h.get(k) or []) for k in hkeys}
+    hourly = []
+    for i, t in enumerate(ht):
+        hourly.append({"time": t, **{k: (hcols[k][i] if i < len(hcols[k]) else None) for k in hkeys}})
+
+    tag, reasons = weather_suitability(today.get("apparent_max"), today.get("precip_prob"),
+                                      today.get("wind_max"), (aqi or {}).get("us_aqi"),
+                                      today.get("weather_code"))
+    return {"name": name, "group": group, "lat": lat, "lon": lon,
+            "today": today, "daily": daily, "hourly": hourly, "aqi": aqi,
+            "current": fc.get("current") or {}, "suit_tag": tag, "suit_reasons": reasons}
+
+
+def get_beijing_weather(today, days_ahead, home_district=None):
+    """并发抓 16 区 + 常骑点。返回 {home, home_points[], districts[], fetched_at} 或 None。
+    home_district 支持逗号/顿号/空格分隔多个常骑点（南海子公园、戒台寺…）。"""
+    home_input = (home_district or "").strip()
+    home_names = [h.strip() for h in re.split(r"[,，、\s]+", home_input) if h.strip()] or ["朝阳"]
+    days = days_ahead or 1
+
+    pts = [(n, la, lo, g) for (n, la, lo, g) in BEIJING_DISTRICTS]
+    for nm in home_names:
+        c = RIDING_SPOTS.get(nm)
+        if c and nm not in _DISTRICT_COORDS:  # 纯常骑点（非16区）额外抓
+            pts.append((nm, c[0], c[1], "常骑点"))
+        elif nm not in _DISTRICT_COORDS and nm not in RIDING_SPOTS:
+            log(f"⚠️ 未识别的常骑点「{nm}」（不在 16 区/RIDING_SPOTS 内），已忽略。")
+
+    def work(p):
+        n, la, lo, g = p
+        return n, _fetch_point(n, la, lo, g, days)
+
+    results = {}
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for n, r in ex.map(work, pts):
+                if r:
+                    results[n] = r
+    except Exception:
+        pass
+    if not results:
+        return None
+
+    districts = [results[n] for n, *_ in BEIJING_DISTRICTS if n in results]
+    home_points = [results[nm] for nm in home_names if nm in results]
+    if not home_points and "朝阳" in results:  # 常骑点全失败 → 回退朝阳
+        home_points = [dict(results["朝阳"], name="朝阳(回退)")]
+    if not home_points:
+        return None
+    return {"home": "、".join(h["name"] for h in home_points),
+            "home_points": home_points, "districts": districts,
+            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+
+# ---- 天气 → markdown 渲染（报告章节 / 教练 prompt / 全量明细） ----
+def _pt_day(pt, date_iso):
+    for day in (pt.get("daily") or []):
+        if str(day.get("date", ""))[:10] == date_iso:
+            return day
+    return None
+
+
+def _weather_window_rows(pt, date_iso, h_lo, h_hi):
+    rows = []
+    for hr in (pt.get("hourly") or []):
+        t = str(hr.get("time", ""))
+        if t[:10] == date_iso and len(t) >= 13 and h_lo <= int(t[11:13]) <= h_hi:
+            rows.append(hr)
+    return rows
+
+
+def _win_row(hr, label):
+    hh = str(hr.get("time", ""))[11:16] or "?"
+    return (f"| {label}{hh} | {fmt_num(hr.get('temperature_2m'),0)} | "
+            f"{fmt_num(hr.get('apparent_temperature'),0)} | {fmt_num(hr.get('precipitation_probability'),0)} | "
+            f"{fmt_num(hr.get('wind_speed_10m'),0)} | {deg_to_dir(hr.get('wind_direction_10m'))} | "
+            f"{fmt_num(hr.get('uv_index'),1)} |")
+
+
+def _weather_majority_tag(pts):
+    tags = [p.get("suit_tag") for p in pts if p.get("suit_tag") in _TAG_ORDER]
+    if not tags:
+        return "—"
+    counts = {}
+    for t in tags:
+        counts[t] = counts.get(t, 0) + 1
+    maxn = max(counts.values())
+    tied = [t for t, n in counts.items() if n == maxn]
+    return min(tied, key=lambda t: _TAG_ORDER[t])
+
+
+def _weather_group_overview(districts, group):
+    pts = [d for d in districts if d.get("group") == group]
+    if not pts:
+        return None
+    tmins = [d["today"].get("tmin") for d in pts if d["today"].get("tmin") is not None]
+    tmaxs = [d["today"].get("tmax") for d in pts if d["today"].get("tmax") is not None]
+    aqis = [(d.get("aqi") or {}).get("us_aqi") for d in pts if (d.get("aqi") or {}).get("us_aqi") is not None]
+    return {
+        "trange": (f"{min(tmins):.0f}~{max(tmaxs):.0f}℃") if tmins and tmaxs else "—",
+        "aqi_range": (f"{min(aqis):.0f}~{max(aqis):.0f}") if aqis else "—",
+        "tag": _weather_majority_tag(pts),
+    }
+
+
+def _next_weekend_dates(today, n=2):
+    """接下来 n 个周末日（周六/周日，含今天若是周末）。"""
+    out, d = [], today
+    while len(out) < n and (d - today).days <= 14:
+        if d.weekday() in (5, 6):
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def weather_show_weekend(today, cfg):
+    """是否展示「周末去哪骑」：周五，或今日在 config.holiday_dates 里。"""
+    if today.weekday() == 4:  # 周五
+        return True
+    holidays = set(str(h) for h in (cfg.get("holiday_dates") or []))
+    return today.isoformat() in holidays
+
+
+def weather_fetch_days(today, show_weekend):
+    """平时抓今明两天；触发周末表时抓到本周日，确保周末两天有数据。"""
+    if not show_weekend:
+        return WEATHER_FORECAST_DAYS
+    days_to_sun = (6 - today.weekday()) % 7  # 0=周一…6=周日
+    return max(WEATHER_FORECAST_DAYS, days_to_sun + 1)
+
+
+def render_weather_section(weather, today, show_weekend=False):
+    """天气章节 markdown 行列表（聚焦呈现）。weather 为 None → []。"""
+    if not weather:
+        return []
+    hps = weather.get("home_points") or []
+    today_iso = today.isoformat()
+    L = ["## 二、今日北京天气与户外训练适宜度\n"]
+    L.append(f"> 数据来源 Open-Meteo（免费无 key）；实时 AQI 抓取于 {weather.get('fetched_at', '?')}。\n")
+
+    # 常骑点（工作日锚点）逐个：一行摘要 + 骑行窗口逐时
+    for hp in hps:
+        t = hp.get("today") or {}
+        aqi = (hp.get("aqi") or {}).get("us_aqi")
+        reasons = "、".join(hp.get("suit_reasons") or []) or "无明显不利因素"
+        L.append(f"**常骑点 · {hp.get('name')}**　{wmo_desc(t.get('weather_code'))}，"
+                 f"{fmt_num(t.get('tmin'),0)}~{fmt_num(t.get('tmax'),0)}℃，体感最高 {fmt_num(t.get('apparent_max'),0)}℃，"
+                 f"降水 {fmt_num(t.get('precip_prob'),0)}%，{deg_to_dir(t.get('wind_dir'))}风 {fmt_num(t.get('wind_max'),0)}km/h，"
+                 f"UV {fmt_num(t.get('uv'),1)}({uv_level(t.get('uv'))})，实时 AQI {fmt_num(aqi,0)}({aqi_level(aqi)})　→　"
+                 f"**适宜度：{hp.get('suit_tag','—')}**（{reasons}）")
+        am = _weather_window_rows(hp, today_iso, 5, 8)
+        pm = _weather_window_rows(hp, today_iso, 17, 20)
+        if am or pm:
+            L.append("")
+            L.append("| 时段 | 温 | 体感 | 降水% | 风 km/h | 风向 | UV |")
+            L.append("|---|---|---|---|---|---|---|")
+            for hr in am:
+                L.append(_win_row(hr, "早"))
+            for hr in pm:
+                L.append(_win_row(hr, "晚"))
+        L.append("")
+
+    # 各区概览（今日，文本行——省一张表，把表格额度留给教练计划表）
+    bits = []
+    for g in ("城六区", "近郊"):
+        ov = _weather_group_overview(weather.get("districts") or [], g)
+        if ov:
+            bits.append(f"{g} 气温 {ov['trange']}、AQI {ov['aqi_range']}（{ov['tag']}）")
+    if bits:
+        L.append("**各区概览（今日）**　" + "；".join(bits))
+        L.append("")
+
+    # 明日天气（只抓今明两天；明日无 AQI 预报，适宜度仅看温/雨/风/恶劣天气码）
+    tmr = today + timedelta(days=1)
+    tmr_iso = tmr.isoformat()
+    tmr_lines = []
+    for hp in hps:
+        day = _pt_day(hp, tmr_iso)
+        if not day:
+            continue
+        tg, _ = weather_suitability(day.get("apparent_max"), day.get("precip_prob"),
+                                    day.get("wind_max"), None, day.get("weather_code"))
+        tmr_lines.append(f"- **{hp.get('name')}**　{wmo_desc(day.get('weather_code'))}，"
+                         f"{fmt_num(day.get('tmin'),0)}~{fmt_num(day.get('tmax'),0)}℃，体感最高 {fmt_num(day.get('apparent_max'),0)}℃，"
+                         f"降水 {fmt_num(day.get('precip_prob'),0)}%，{deg_to_dir(day.get('wind_dir'))}风 {fmt_num(day.get('wind_max'),0)}km/h，"
+                         f"UV {fmt_num(day.get('uv'),1)}({uv_level(day.get('uv'))})　→　**{tg}**")
+    if tmr_lines:
+        L.append(f"**明日天气（{tmr_iso} {weekday_cn(tmr)}）**\n")
+        L.extend(tmr_lines)
+        L.append("")
+
+    # 周末去哪骑（仅周五 / 节假日触发；未来日无 AQI，适宜度仅看温/雨/风/恶劣天气）
+    if show_weekend:
+        wdates = _next_weekend_dates(today, 2)
+        dmap = {d.get("name"): d for d in (weather.get("districts") or [])}
+        if wdates:
+            L.append("**周末去哪骑（近/远郊热点）**\n")
+            L.append("| 地点 |" + "".join(f" {weekday_cn(dd)}{dd.isoformat()[5:]} |" for dd in wdates) + " 综合适宜度 |")
+            L.append("|---|" + "---|" * (len(wdates) + 1))
+            for nm in WEEKEND_DESTINATIONS:
+                pt = dmap.get(nm)
+                if not pt:
+                    continue
+                cells, dtags = [], []
+                for dd in wdates:
+                    day = _pt_day(pt, dd.isoformat())
+                    if day:
+                        cells.append(f"{wmo_desc(day.get('weather_code'))} {fmt_num(day.get('tmax'),0)}℃ 降水{fmt_num(day.get('precip_prob'),0)}%")
+                        tg, _ = weather_suitability(day.get("apparent_max"), day.get("precip_prob"), day.get("wind_max"), None, day.get("weather_code"))
+                        dtags.append(tg)
+                    else:
+                        cells.append("—"); dtags.append("—")
+                L.append(f"| {nm} | " + " | ".join(cells) + f" | {_worst_tag(dtags)} |")
+            L.append("")
+
+    # 一句建议（取所有常骑点最差适宜度）
+    valid = [hp for hp in hps if hp.get("suit_tag") in _TAG_ORDER]
+    worst_hp = min(valid, key=lambda h: _TAG_ORDER[h.get("suit_tag")]) if valid else None
+    worst = worst_hp.get("suit_tag") if worst_hp else "—"
+    if worst == "宜":
+        adv = "常骑点天气适宜，可按计划户外骑行。"
+    elif worst == "注意":
+        adv = (f"注意：{'、'.join(worst_hp.get('suit_reasons') or [])}；建议避开午间高温/高 AQI 时段，"
+               f"强度酌降或改清晨/晚窗。")
+    elif worst == "不宜户外":
+        adv = f"今日不宜户外骑行（{'、'.join(worst_hp.get('suit_reasons') or [])}）；建议改室内骑行台或休息。"
+    else:
+        adv = "按计划与体感执行。"
+    L.append(f"**今日户外骑行建议**：{adv}\n")
+    return L
+
+
+def weather_full_table_lines(weather):
+    """全 16 区明细表（--weather-only 调试用）。"""
+    L = ["| 区 | 天气 | 气温 | 体感最高 | 降水% | 风 | UV | AQI | 等级 | 适宜度 |"]
+    L.append("|---|---|---|---|---|---|---|---|---|---|")
+    for d in (weather.get("districts") or []):
+        t = d.get("today", {})
+        aqi = (d.get("aqi") or {}).get("us_aqi")
+        L.append(f"| {d['name']} | {wmo_desc(t.get('weather_code'))} | "
+                 f"{fmt_num(t.get('tmin'),0)}~{fmt_num(t.get('tmax'),0)} | {fmt_num(t.get('apparent_max'),0)} | "
+                 f"{fmt_num(t.get('precip_prob'),0)} | {deg_to_dir(t.get('wind_dir'))}风{fmt_num(t.get('wind_max'),0)} | "
+                 f"{fmt_num(t.get('uv'),1)} | {fmt_num(aqi,0)} | {aqi_level(aqi)} | {d.get('suit_tag','—')} |")
+    return L
+
+
+def _sample_point(name, group, lat, lon, today, off):
+    tmax, tmin, app = 33 + off, 24 + off, 37 + off
+    wcodes = [2, 1, 63, 0, 3, 2, 95]
+    pprobs = [20, 15, 60, 10, 40, 25, 80]
+    daily = []
+    for i in range(7):  # 样例生成一周，供「周末去哪骑」演示
+        d = today + timedelta(days=i)
+        daily.append({"date": d.isoformat(), "tmax": tmax + i % 3, "tmin": tmin, "apparent_max": app + i % 3,
+                      "precip_prob": pprobs[i % 7], "wind_max": 18, "wind_dir": 90, "uv": 8,
+                      "weather_code": wcodes[i % 7]})
+    hourly = []
+    for hh in (5, 6, 7, 8, 17, 18, 19, 20):
+        hourly.append({"time": f"{today.isoformat()}T{hh:02d}:00", "temperature_2m": 24 + hh % 5,
+                       "apparent_temperature": 26 + hh % 5, "precipitation_probability": 20,
+                       "wind_speed_10m": 15, "wind_direction_10m": 90,
+                       "uv_index": 2.0 if hh < 10 else 0.5, "weather_code": 2})
+    aqi = {"us_aqi": 132, "pm2_5": 55, "pm10": 78}
+    tag, reasons = weather_suitability(app, 20, 18, 132)
+    return {"name": name, "group": group, "lat": lat, "lon": lon, "today": daily[0],
+            "daily": daily, "hourly": hourly, "aqi": aqi, "current": {},
+            "suit_tag": tag, "suit_reasons": reasons}
+
+
+def sample_weather(today):
+    home_pts = [_sample_point("南海子公园", "常骑点", 39.76, 116.50, today, 0),
+                _sample_point("戒台寺", "常骑点", 39.97, 116.09, today, -1)]
+    districts = [_sample_point(n, g, la, lo, today, (i % 4) - 1)
+                 for i, (n, la, lo, g) in enumerate(BEIJING_DISTRICTS)]
+    return {"home": "南海子公园、戒台寺", "home_points": home_pts,
+            "districts": districts, "fetched_at": "(样例)"}
+
+
+# ---------------------------------------------------------------------------
 # glm-5.2 教练：把历史训练数据交给 LLM（角色=自行车教练）生成未来计划
 # ---------------------------------------------------------------------------
 SYSTEM_COACH = (
-    "你是一位资深自行车教练兼运动营养师，精通功率训练、PMC 模型与周期化："
-    "CTL≈长期体能(约42天加权)，ATL≈短期疲劳(约7天加权)，TSB=CTL−ATL（>5清爽、−10~5中性、<−10疲劳、<−30严重疲劳）。"
-    "你会综合车手的【个人档案与目标、当日 readiness(睡眠/HRV/静息心率)、可训练时间窗、季节与阶段、近期训练负荷】，"
-    "制定科学且【能在真实时间窗内执行】的计划，并给配套饮食建议。"
-    "铁律：疲劳高或 readiness 差时优先恢复与睡眠；强度日与恢复日交替；循序渐进绝不堆量过载（别让 TSB 长期 <−20）。"
-    "用中文回答，语气专业、简洁、可直接照做。"
+    "你是一位资深自行车教练兼运动营养师，为【这一位具体车手】量身排课——紧扣其档案、目标与限制，不要泛泛而谈。"
+    "精通功率训练、PMC 与周期化：CTL≈长期体能(约42天加权)，ATL≈短期疲劳(约7天加权)，"
+    "TSB=CTL−ATL（>5清爽、−10~5中性、<−10疲劳、<−30严重疲劳）。\n"
+    "执教原则：①周期化——围绕目标赛事递进(base/build/peak/taper)，由当前阶段决定侧重；"
+    "②两极化——强度日真强(Z4/Z5/甜区)、恢复日真轻松(Z1/Z2)，避免整天堆在 Z3 灰色地带累积疲劳；"
+    "③渐进负荷——周总 TSS 与周末长骑时长增幅 ≤10-15%，绝不堆量过载(别让 TSB 长期 <−20)；"
+    "④伤病优先——「伤病/限制」是硬约束，宁可保守也不安排会加重它的课；"
+    "⑤可执行——所有课必须落在真实时间窗内(工作日早 ≤8 点前到家)；"
+    "⑥恢复优先——疲劳高或 readiness 差时先恢复与睡眠。"
+    "综合【个人档案/目标、当日 readiness、可训练时间窗、季节与阶段、近期负荷与伤病】排课，并给配套饮食/补给建议。"
+    "用中文，专业、简洁、可直接照做。"
 )
 
 
+# 北京户外骑行季单一事实源：月份 → (季节提示文本, 默认训练阶段)
+# 户外季 3-11 月（含 3、11 月）；12-2 月无骑行台 → 跑步/力量交叉训练（off-season）。
+# season_hint 与 phase_for_season 都从此派生，改季节只动这一张表
+# （config 的 winter_note 是给教练看的自由文本，另算）。
+_BEIJING_SEASON = {
+    1:  ("冬休·无骑行台，跑步/力量交叉训练（12-2月）", "transition"),
+    2:  ("冬休·无骑行台，跑步/力量交叉训练（12-2月）", "transition"),
+    3:  ("季前·转户外打基础", "base"),
+    4:  ("季前·转户外打基础", "base"),
+    5:  ("旺季·户外", "build"),
+    6:  ("旺季·户外", "build"),
+    7:  ("旺季·户外", "build"),
+    8:  ("旺季·户外", "build"),
+    9:  ("旺季·户外", "build"),
+    10: ("季末·户外（10-11月，仍可户外，逐步转室内）", "build"),
+    11: ("季末·户外（10-11月，仍可户外，逐步转室内）", "build"),
+    12: ("冬休·无骑行台，跑步/力量交叉训练（12-2月）", "transition"),
+}
+_DEFAULT_SEASON = ("旺季·户外", "build")  # 兜底（12 个月全覆盖，理论上不命中）
+
+
 def season_hint(today):
-    """按北京气候给季节阶段提示（冬训室内 / 转户外 / 赛季 / 过渡）。"""
-    m = today.month
-    if m in (11, 12, 1, 2):
-        return "冬训·室内骑行台（北京户外不宜）"
-    if m in (3, 4):
-        return "转户外 + 巅峰期"
-    if m in (5, 6, 7, 8, 9):
-        return "赛季·户外"
-    return "赛季末 + 过渡"
+    """北京户外骑行季 = 3月~11月底；12月~2月无骑行台，转跑步/力量交叉训练。按月给季节阶段提示（派生自 _BEIJING_SEASON）。"""
+    return _BEIJING_SEASON.get(today.month, _DEFAULT_SEASON)[0]
 
 
 def load_readiness():
@@ -407,6 +975,8 @@ def load_readiness():
 
 
 READINESS_HISTORY = os.path.join(HERE, "readiness_history.jsonl")
+REST_FLAGS = os.path.join(HERE, "rest_flags.json")          # 用户标记的休息日 {"rest_dates":[...]}
+PLAN_GEN_FLAG = os.path.join(HERE, "last_plan_gen.txt")     # 上次 AI 生成计划的日期（降频复用用）
 
 
 def _read_readiness_history():
@@ -536,8 +1106,25 @@ def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None):
     u = [f"今天是 {today.isoformat()}（{weekday_cn(today)}）。以下是这位车手的真实档案与数据：", ""]
 
     u.append("**【个人档案 / 目标 / 时间表】**")
-    u.append(f"- 体重 {prof.get('weight_kg','?')}kg，FTP {prof.get('ftp','?')}W，目标：{prof.get('goal','提高FTP')}")
+    # 生理基线：年龄由 birth_year 推（或直接 age），性别/身高可选
+    _by, _age_cfg = prof.get("birth_year"), prof.get("age")
+    _age = f"{today.year - int(_by)}岁、 " if isinstance(_by, int) else (f"{_age_cfg}岁、 " if _age_cfg else "")
+    _sex = f"{prof.get('gender')}、" if prof.get("gender") else ""
+    _hgt = f"{prof.get('height_cm')}cm/" if prof.get("height_cm") else ""
+    _hr = (f"，MHR {prof.get('mhr')}" if prof.get("mhr") else "") + (f"/LTHR {prof.get('lthr')}" if prof.get("lthr") else "")
+    if _hr:
+        _hr += "bpm"
+    u.append(f"- {_age}{_sex}{_hgt}{prof.get('weight_kg','?')}kg，FTP {prof.get('ftp','?')}W{_hr}")
     u.append(f"- 所在地 {prof.get('location','?')}；季节阶段：{season_hint(today)}；训练阶段：{prof.get('phase','base')}")
+    _te = prof.get("target_event")
+    u.append(f"- **目标方向**：{_te or prof.get('goal','提高FTP')}"
+             + (f"（请据此做周期化，向目标递进；当前阶段={prof.get('phase','base')}）" if _te else ""))
+    _cs = prof.get("constraints")
+    if _cs:
+        u.append(f"- ⚠️ **伤病/限制（排课须规避或缓解）**：{_cs if isinstance(_cs, str) else '；'.join(_cs)}")
+    _pf = prof.get("preferences")
+    if _pf:
+        u.append(f"- 偏好（提高执行率，但勿牺牲科学性）：{_pf if isinstance(_pf, str) else '；'.join(_pf)}")
     if sched:
         u.append(f"- 工作日早窗：{sched.get('weekday_am','?')}")
         u.append(f"- 工作日晚窗：{sched.get('weekday_pm','?')}")
@@ -579,6 +1166,11 @@ def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None):
     u.append('```')
     u.append(f"要求：days 覆盖 {start_date.isoformat()} 起 {days_ahead} 天、日期连续；action=rest 时 duration_min=0/tss=0/if=0/zone=\"\"；"
              f"zone 取 Z1/Z2/Z3/Z4/Z5/Z6 或\"甜区\"；if 为 0~1.2 的小数。强度(TSS)循序渐进，勿让 TSB 长期 <−20。")
+    if prof.get("constraints"):
+        u.append("【硬约束·伤病】严格遵守上面「伤病/限制」，不得安排会加重它的课——"
+                 "爬坡致腰疼→控制单次连续爬坡时长、穿插平路/伸展/核心训练；"
+                 "平路或下坡致颈疼→分段骑行、变换握姿、加颈部放松与核心；"
+                 "长课务必安排中途起身/变换姿势。")
     return SYSTEM_COACH, "\n".join(u)
 
 
@@ -595,6 +1187,7 @@ def call_llm(cfg, system, user):
                      {"role": "user", "content": user}],
         "temperature": 0.6,
         "stream": False,
+        "thinking": {"type": "enabled", "budget_tokens": 4096},  # 开启思考：深度整合 readiness+PMC+历史骑行做分析；封顶 4096 token
     }).encode("utf-8")
     req = urllib.request.Request(endpoint, data=body, method="POST", headers={
         "Authorization": f"Bearer {key}",
@@ -603,7 +1196,7 @@ def call_llm(cfg, system, user):
     last = None
     for attempt in range(2):  # 网络/SSL 抖动时重试 1 次
         try:
-            with _urlopen(req, 90) as r:
+            with _urlopen(req, 240) as r:
                 obj = json.loads(r.read().decode("utf-8"))
             last = None
             break
@@ -736,6 +1329,104 @@ def normalize_plan_days(plan, today, days_ahead, start_date=None):
 
 
 # ---------------------------------------------------------------------------
+# 计划自洽校验：按生成的 TSS 用 PMC 递推公式前向推演 CTL/ATL/TSB
+# ---------------------------------------------------------------------------
+def project_tsb(plan_days, ctl0, atl0, ctl_tc=42.0, atl_tc=7.0):
+    """CTL_t = CTL_{t-1} + (TSS_{t-1} - CTL_{t-1}) * (1 - e^{-1/ctl_tc})；ATL 同理（atl_tc=7）。
+    plan_days 取自 normalize_plan_days（含 'tss'，休息日为 0）。ctl0/atl0 为今日最新 PMC 值。
+    返回 [{"date","tss","ctl","atl","tsb"}] 按日期升序；ctl0/atl0 缺失或无计划返回 []。"""
+    if ctl0 is None or atl0 is None or not plan_days:
+        return []
+    ctl, atl = float(ctl0), float(atl0)
+    kc = 1 - math.exp(-1.0 / ctl_tc)
+    ka = 1 - math.exp(-1.0 / atl_tc)
+    out = []
+    for d in sorted(plan_days, key=lambda x: x["date"]):
+        tss = float(d.get("tss") or 0)
+        ctl += (tss - ctl) * kc
+        atl += (tss - atl) * ka
+        out.append({"date": d["date"].isoformat() if hasattr(d["date"], "isoformat") else str(d["date"]),
+                    "tss": tss, "ctl": ctl, "atl": atl, "tsb": ctl - atl})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 目标日期驱动的训练阶段（phase）建议
+# ---------------------------------------------------------------------------
+def suggest_phase(target_date, today):
+    """按距目标日期的剩余周数建议阶段（经验映射）：
+    已过→transition；≤1周→peak(减量)；1-3周→build；>3周→base。无目标返回 None。
+    target_date 为 ISO 字符串/date；today 为 date 对象。"""
+    td = parse_date(str(target_date)[:10]) if target_date else None
+    if not td or not today:
+        return None
+    weeks = (td - today).days / 7.0
+    if weeks < 0:
+        return "transition"
+    if weeks <= 1:
+        return "peak"
+    if weeks <= 3:
+        return "build"
+    return "base"
+
+
+def _extract_event_date(cfg):
+    """从 coach_profile 抽目标日期：优先 target_date(YYYY-MM-DD)，否则从 target_event 文本抓 20YY-MM(-DD)。
+    文本里有多个日期时取【最后一个】（通常是真正的目标，避免抓到总结里的历史日期）。"""
+    prof = cfg.get("coach_profile") or {}
+    d = parse_date(str(prof.get("target_date") or "")[:10])
+    if d:
+        return d
+    te = str(prof.get("target_event") or "")
+    matches = re.findall(r"(20\d{2})-(\d{1,2})(?:-(\d{1,2}))?", te)
+    if matches:
+        y, mo, d_ = matches[-1]
+        try:
+            return date(int(y), int(mo), int(d_ or "1"))
+        except ValueError:
+            return None
+    return None
+
+
+def phase_for_season(month):
+    """无明确赛事时，按北京户外季给默认阶段（派生自 _BEIJING_SEASON）：
+    户外旺季(5-11月)→build；季前(3-4月)→base；冬休(12-2月，无骑行台/交叉训练)→transition。
+    month 为 None 返回 None。"""
+    if month is None:
+        return None
+    return _BEIJING_SEASON.get(month, _DEFAULT_SEASON)[1]
+
+
+def phase_advisory(cfg, today):
+    """训练阶段建议：优先按目标赛事日期（suggest_phase）；无赛事则按北京户外季（phase_for_season）。
+    phase_autosync=true 时写回 config，否则仅文字提示。返回 markdown 或 None。"""
+    if not cfg:
+        return None
+    prof = cfg.setdefault("coach_profile", {})  # setdefault：确保 phase 写回能落盘（避免 or {} 拿到游离 dict）
+    cur = str(prof.get("phase") or "base").strip()
+    td = _extract_event_date(cfg)
+    if td:
+        sug = suggest_phase(td, today)
+        days_to = (td - today).days
+        reason = (f"目标（{td.isoformat()}）已过" if days_to < 0
+                  else f"距目标（{td.isoformat()}，约 {days_to / 7.0:.0f} 周）")
+    else:
+        sug = phase_for_season(today.month)
+        reason = "按北京户外季（3-11月户外、12-2月室内）"
+    if not sug or sug == cur:
+        return None
+    head = f"🗓️ **阶段建议**：{reason}建议进入 **{sug}** 阶段（当前 {cur}）。"
+    if cfg.get("phase_autosync"):
+        prof["phase"] = sug
+        try:
+            save_config(cfg)
+            return head + f" 已按 phase_autosync 自动写回 config → phase={sug}。"
+        except Exception as e:
+            return head + f"（自动写回失败：{e}，请手动改 phase）"
+    return head + " 未开启 phase_autosync；如需自动切换在 config 设 \"phase_autosync\": true。"
+
+
+# ---------------------------------------------------------------------------
 # 微信推送（Server酱）
 # ---------------------------------------------------------------------------
 def push_serverchan(cfg, title, desp):
@@ -764,7 +1455,554 @@ def push_serverchan(cfg, title, desp):
     return False
 
 
-def build_report(pmc, rides, planned, training_plans, today, days_back, days_ahead, coach_md=None, coach_model=""):
+def push_alert(cfg, title, msg, images=None):
+    """告警推送（--auto 无人值守时的关键失败用）：serverchan + 飞书都试，任一配了 key 就推。
+    images（PNG bytes 列表）只发给飞书（Server酱不支持图）。至少一个成功返回 True。"""
+    ok = False
+    if (cfg.get("serverchan_key") or "").strip():
+        ok = push_serverchan(cfg, title, msg) or ok
+    if (cfg.get("feishu_app_id") or "").strip():
+        try:
+            ok = push_feishu(cfg, title, msg, images=images) or ok
+        except Exception as e:
+            print(f"飞书告警推送失败: {e}", file=sys.stderr)
+    if not ok:
+        print(f"⚠️ 推送失败或未配置任何通道：{title}", file=sys.stderr)
+    return ok
+
+
+def _feishu_table_to_text(lines):
+    """连续的 markdown 表格行 → 飞书卡片可读的列表形式（兜底用）。
+    飞书 markdown 不支持表格，正常路径走 _feishu_parse_table 转 table 元素。
+    """
+    rows = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln.startswith("|"):
+            continue
+        if re.match(r"^\|[\s:|\-]+\|?$", ln):  # 分隔行 |---|---|
+            continue
+        rows.append([c.strip() for c in ln.strip("|").split("|")])
+    if not rows:
+        return []
+    out = ["**" + " ｜ ".join(rows[0]) + "**"]  # 表头加粗
+    for r in rows[1:]:
+        out.append("• " + " ｜ ".join(r))
+    return out
+
+
+def _feishu_parse_table(lines):
+    """连续 markdown 表格行 → 飞书原生 table 元素的 {columns, rows}。
+    返回 None 表示不是合法表格。飞书限制：最多 10 列、每卡最多 5 个表。
+    """
+    rows_raw = []
+    for ln in lines:
+        s = ln.strip()
+        if not s.startswith("|"):
+            continue
+        if re.match(r"^\|[\s:|\-]+\|?$", s):  # 分隔行 |---|---|
+            continue
+        rows_raw.append([c.strip() for c in s.strip("|").split("|")])
+    if len(rows_raw) < 2:  # 至少表头 + 1 行数据
+        return None
+    header = rows_raw[0]
+    ncols = min(len(header), 10)  # 飞书硬限 10 列
+    columns = [{
+        "name": f"c{i}",
+        "display_name": header[i] if i < len(header) else "",
+        "data_type": "text",
+        "horizontal_align": "left",
+    } for i in range(ncols)]
+    rows = []
+    for r in rows_raw[1:]:
+        rows.append({f"c{i}": (r[i] if i < len(r) else "") for i in range(ncols)})
+    return {"columns": columns, "rows": rows}
+
+
+def _feishu_split_md_paragraphs(text, limit=3500):
+    """按空行把 markdown 切成多段，每段不超过 limit 字符（飞书 markdown
+    元素过长会降级为纯文本渲染，造成「乱码」感）。"""
+    text = text.strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    out, buf = [], ""
+    for p in parts:
+        if len(p) > limit:
+            p = p[:limit - 1] + "…"
+        if not buf:
+            buf = p
+        elif len(buf) + 2 + len(p) <= limit:
+            buf = buf + "\n\n" + p
+        else:
+            out.append(buf)
+            buf = p
+    if buf:
+        out.append(buf)
+    return out
+
+
+FEISHU_MAX_TABLES = 5  # 飞书单卡片表格数量上限，超出整张卡片会被拒（HTTP 400）
+
+
+def _feishu_section_to_elements(sec_lines, table_counter, total_tables):
+    """处理一个 ## 段落 → element 列表。表格用原生 table 元素，
+    其余按空行切成多个小 markdown 元素，避免飞书 markdown 过长降级。
+    table_counter[0] 是当前表的全局序号；total_tables 是全卡总表数——
+    超飞书上限(5)时优先保留前几张 + 末张(末张=教练计划表)，中间多余的转文本。
+    """
+    out, md_buf, table_buf = [], [], []
+
+    def flush_md():
+        if not md_buf:
+            return
+        text = "\n".join(md_buf).strip()
+        md_buf.clear()
+        if not text:
+            return
+        # ## / ### 标题 → 行内粗体
+        cleaned = []
+        for ln in text.splitlines():
+            m = re.match(r"^(#{2,6})\s+(.*)$", ln)
+            cleaned.append(f"**{m.group(2).strip()}**" if m else ln)
+        for chunk in _feishu_split_md_paragraphs("\n".join(cleaned)):
+            out.append({"tag": "markdown", "content": chunk})
+
+    def flush_table():
+        if not table_buf:
+            return
+        tbl = _feishu_parse_table(table_buf)
+        idx = table_counter[0]
+        # 优先保留「前几张 + 末张」(末张即教练计划表)；超限时把中间多余的表转文本
+        keep = tbl is not None and (idx < FEISHU_MAX_TABLES - 1 or idx == total_tables - 1)
+        if keep:
+            flush_md()  # 先把前面攒的 markdown 冲掉
+            out.append({
+                "tag": "table",
+                "page_size": min(20, max(1, len(tbl["rows"]))),
+                "row_height": "low",
+                "header_style": {
+                    "text_align": "left",
+                    "text_size": "normal",
+                    "bold": True,
+                },
+                "columns": tbl["columns"],
+                "rows": tbl["rows"],
+            })
+        else:
+            # 超飞书上限(5)的中间表、或非合法表 → 回退为列表文本
+            md_buf.extend(_feishu_table_to_text(table_buf))
+        table_counter[0] += 1  # 无论是否保留，全局序号都要前进
+        table_buf.clear()
+
+    for ln in sec_lines:
+        if ln.lstrip().startswith("|"):
+            table_buf.append(ln)
+        else:
+            flush_table()
+            md_buf.append(ln)
+    flush_table()
+    flush_md()
+    return out
+
+
+def _count_table_blocks(lines):
+    """数一段 lines 里有几个 markdown 表格块（连续 | 开头的行算一块，分隔行不影响计数）。"""
+    n, in_tbl = 0, False
+    for ln in lines:
+        if ln.lstrip().startswith("|"):
+            if not in_tbl:
+                n += 1
+                in_tbl = True
+        else:
+            in_tbl = False
+    return n
+
+
+def _feishu_card_elements(content):
+    """把完整报告 markdown 切成飞书卡片 elements 数组：
+    - 首行 # H1 标题丢给 card.header，不进正文
+    - ## 段各自一块，段间插 hr 分隔线
+    - markdown 表格 → 飞书原生 table 元素（飞书 markdown 不渲染表格）
+    - 长 markdown 段落按空行切成多个小 markdown 元素，避免过长被降级
+    - 末尾 --- 之后的短说明（无二级标题、≤500 字）放进 note 灰色脚注
+    """
+    lines = content.splitlines()
+    # 丢掉首个 H1
+    for i, ln in enumerate(lines):
+        if ln.startswith("# "):
+            lines = lines[:i] + lines[i + 1:]
+            break
+    # 从末尾找最近一个 --- 作脚注边界：其后内容需短、无 ## 标题（避免吞掉 coach_md 中段的 ---）
+    footer = []
+    cut_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() == "---":
+            tail = [x for x in lines[i + 1:] if x.strip()]
+            tail_text = "\n".join(tail)
+            if len(tail_text) <= 500 and not any(l.lstrip().startswith("#") for l in tail):
+                cut_idx = i
+                footer = tail
+                break
+    if cut_idx is not None:
+        lines = lines[:cut_idx]
+    # 按 ## 切段
+    sections = [[]]
+    for ln in lines:
+        if ln.startswith("## "):
+            sections.append([ln])
+        else:
+            sections[-1].append(ln)
+    total_tables = sum(_count_table_blocks(sec) for sec in sections)
+    elements = []
+    table_counter = [0]  # 飞书单卡最多 5 个表；超限时优先保留首表+末表(教练计划表)
+    for sec in sections:
+        sec_elements = _feishu_section_to_elements(sec, table_counter, total_tables)
+        if not sec_elements:
+            continue
+        if elements:  # 段间分隔线（跳过首个）
+            elements.append({"tag": "hr"})
+        elements.extend(sec_elements)
+    if footer:
+        if elements:
+            elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": "  ".join(footer)[:800]}],
+        })
+    return elements
+
+
+# ---------------------------------------------------------------------------
+# 训练图表（Pillow 可选）：计划 vs 实际 TSS、PMC 体能/疲劳趋势。CVD 安全配色（Okabe-Ito）。
+# 单轴原则：TSS 一图、CTL/ATL 一图（TSB<0 的疲劳区用背景红带表示，不另开轴）。
+# ---------------------------------------------------------------------------
+_CH_BLUE = (0, 114, 178)      # CTL / 计划柱
+_CH_SKY = (86, 180, 233)      # 计划柱（浅）
+_CH_VERM = (213, 94, 0)       # ATL / 实际柱
+_CH_INK = (40, 44, 52)
+_CH_MUTED = (150, 156, 166)
+_CH_GRID = (232, 234, 237)
+_CH_FATIGUE = (245, 220, 220)  # TSB<0 疲劳区背景
+
+_CJK_FONT_PATHS = [
+    r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\simhei.ttf", r"C:\Windows\Fonts\Deng.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+]
+_PIL_FONT_CACHE = {}
+
+
+def _pil_font(size, bold=False):
+    """加载 CJK 字体（msyh 等），找不到回退默认字体。缓存。"""
+    if not HAVE_PIL:
+        return None
+    key = (size, bold)
+    if key in _PIL_FONT_CACHE:
+        return _PIL_FONT_CACHE[key]
+    paths = ([r"C:\Windows\Fonts\msyhbd.ttc"] if bold else []) + _CJK_FONT_PATHS
+    f = None
+    for p in paths:
+        try:
+            f = ImageFont.truetype(p, size); break
+        except Exception:
+            continue
+    if f is None:
+        f = ImageFont.load_default()
+    _PIL_FONT_CACHE[key] = f
+    return f
+
+
+def _img_to_png(img):
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _planned_actual_rows(planned_by_date, actual_by_date, today, days_back=21):
+    """近 days_back 天（升序）每日 (iso, planned_tss, actual_tss)，只含有训练/实际的日子。"""
+    rows = []
+    for i in range(days_back):
+        d = today - timedelta(days=days_back - 1 - i)
+        iso = d.isoformat()
+        p = float(planned_by_date.get(iso) or 0)
+        a = float(actual_by_date.get(iso) or 0)
+        if p > 0 or a > 0:
+            rows.append((iso, p, a))
+    return rows
+
+
+def chart_planned_vs_actual(rows, title="计划 vs 实际 TSS（近 N 天）"):
+    """分组柱状图：每日 计划(浅蓝) vs 实际(橙)。等高=完成、矮=欠、高=超。返回 PNG bytes 或 None。"""
+    if not HAVE_PIL or not rows:
+        return None
+    rows = [(d, max(0.0, float(p or 0)), max(0.0, float(a or 0))) for d, p, a in rows]
+    n = len(rows)
+    W = max(640, 64 * n + 120); H = 360
+    img = Image.new("RGB", (W, H), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    f_title = _pil_font(20, bold=True); f_lbl = _pil_font(13); f_tick = _pil_font(12)
+    d.text((20, 12), title, font=f_title, fill=_CH_INK)
+    top, bottom, left, right = 56, H - 40, 56, W - 24
+    plot_w = right - left; plot_h = bottom - top
+    vmax = max([max(p, a) for _, p, a in rows] + [50]) * 1.15
+    for i in range(5):
+        y = bottom - plot_h * i / 4
+        d.line([(left, y), (right, y)], fill=_CH_GRID, width=1)
+        d.text((4, y - 8), f"{vmax * i / 4:.0f}", font=f_tick, fill=_CH_MUTED)
+    group_w = plot_w / n
+    bar_w = min(16.0, group_w / 3.4)
+    gap = 2
+    for i, (iso, p, a) in enumerate(rows):
+        cx = left + group_w * (i + 0.5)
+        x1 = cx - bar_w - gap / 2; x2 = cx + gap / 2
+        d.rectangle([x1, bottom - plot_h * (p / vmax), x1 + bar_w, bottom], fill=_CH_SKY)
+        d.rectangle([x2, bottom - plot_h * (a / vmax), x2 + bar_w, bottom], fill=_CH_VERM)
+        d.text((cx - 15, bottom + 6), iso[5:].replace("-", "/"), font=f_tick, fill=_CH_MUTED)
+    lx, ly = W - 184, 20
+    d.rectangle([lx, ly, lx + 14, ly + 14], fill=_CH_SKY); d.text((lx + 20, ly - 2), "计划", font=f_lbl, fill=_CH_INK)
+    d.rectangle([lx + 82, ly, lx + 96, ly + 14], fill=_CH_VERM); d.text((lx + 102, ly - 2), "实际", font=f_lbl, fill=_CH_INK)
+    return _img_to_png(img)
+
+
+def chart_pmc_load(pmc_pts, title="体能 CTL / 疲劳 ATL（红带=TSB<0 过载）"):
+    """CTL(蓝)+ATL(橙) 折线，ATL>CTL 区段背景标红表示疲劳/过载。返回 PNG bytes 或 None。"""
+    if not HAVE_PIL or not pmc_pts:
+        return None
+    pts = [(x[0], to_num(x[1]), to_num(x[2])) for x in pmc_pts
+           if to_num(x[1]) is not None and to_num(x[2]) is not None]
+    if len(pts) < 2:
+        return None
+    W, H = 760, 320
+    img = Image.new("RGB", (W, H), (255, 255, 255))
+    dr = ImageDraw.Draw(img)
+    f_title = _pil_font(18, bold=True); f_tick = _pil_font(12); f_lbl = _pil_font(13)
+    dr.text((20, 10), title, font=f_title, fill=_CH_INK)
+    top, bottom, left, right = 50, H - 36, 56, W - 20
+    plot_w = right - left; plot_h = bottom - top
+    vals = [v for _, c, a in pts for v in (c, a)]
+    vmin = min(min(vals) * 0.9, 0); vmax = max(vals) * 1.1
+    span = (vmax - vmin) or 1.0
+    n = len(pts)
+    xy = lambda i, v: (left + plot_w * (i / (n - 1)),
+                       bottom - plot_h * ((v - vmin) / span))
+    # 疲劳背景带（ATL>CTL 的连续区段）
+    i = 0
+    while i < n - 1:
+        if pts[i][2] > pts[i][1]:
+            j = i
+            while j < n - 1 and pts[j][2] > pts[j][1]:
+                j += 1
+            x0 = left + plot_w * (i / (n - 1)); x1 = left + plot_w * (j / (n - 1))
+            dr.rectangle([x0, top, x1, bottom], fill=_CH_FATIGUE)
+            i = j
+        else:
+            i += 1
+    for s in range(5):
+        y = bottom - plot_h * s / 4
+        dr.line([(left, y), (right, y)], fill=_CH_GRID, width=1)
+        dr.text((4, y - 8), f"{vmin + span * s / 4:.0f}", font=f_tick, fill=_CH_MUTED)
+    dr.line([xy(i, a) for i, (_, c, a) in enumerate(pts)], fill=_CH_VERM, width=2)
+    dr.line([xy(i, c) for i, (_, c, a) in enumerate(pts)], fill=_CH_BLUE, width=2)
+    lx, ly = W - 210, 14
+    dr.line([(lx, ly + 7), (lx + 18, ly + 7)], fill=_CH_BLUE, width=2); dr.text((lx + 24, ly - 2), "CTL 体能", font=f_lbl, fill=_CH_INK)
+    dr.line([(lx + 104, ly + 7), (lx + 122, ly + 7)], fill=_CH_VERM, width=2); dr.text((lx + 128, ly - 2), "ATL 疲劳", font=f_lbl, fill=_CH_INK)
+    # 首尾日期
+    dr.text((left, bottom + 8), str(pts[0][0])[:10], font=f_tick, fill=_CH_MUTED)
+    dr.text((right - 40, bottom + 8), str(pts[-1][0])[:10], font=f_tick, fill=_CH_MUTED)
+    return _img_to_png(img)
+
+
+def _feishu_get_token(app_id, app_secret):
+    """用 app_id/app_secret 换 tenant_access_token。失败抛 ApiError。"""
+    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST",
+        headers={"Content-Type": "application/json"})
+    with _urlopen(req, 30) as r:
+        obj = json.loads(r.read().decode("utf-8"))
+    if obj.get("code") != 0:
+        raise ApiError(f"飞书 token 失败: {obj.get('msg') or obj}")
+    return obj["tenant_access_token"]
+
+
+def _feishu_resolve_chat(token, cfg):
+    """解析目标群 chat_id：优先 config.feishu_chat_id；否则列出机器人所在群自动取。返回 None 表示失败。"""
+    chat_id = (cfg.get("feishu_chat_id") or "").strip()
+    if chat_id:
+        return chat_id
+    req = urllib.request.Request("https://open.feishu.cn/open-apis/im/v1/chats?page_size=50",
+        method="GET", headers={"Authorization": f"Bearer {token}"})
+    with _urlopen(req, 30) as r:
+        obj = json.loads(r.read().decode("utf-8"))
+    if obj.get("code") != 0:
+        print(f"飞书列出群失败（需开权限 im:chat:readonly）: {obj.get('msg') or obj}", file=sys.stderr)
+        return None
+    items = ((obj.get("data") or {}).get("items")) or []
+    if not items:
+        print("飞书机器人未加入任何群：请把应用机器人拉进一个飞书群，或在 config 设 feishu_chat_id。", file=sys.stderr)
+        return None
+    if len(items) == 1:
+        return items[0].get("chat_id")
+    names = "\n".join(f"  - {it.get('name','?')} → chat_id={it.get('chat_id')}" for it in items)
+    print(f"飞书机器人在多个群，请在 config.json 的 feishu_chat_id 指定一个：\n{names}", file=sys.stderr)
+    return None
+
+
+def _feishu_upload_image(token, png_bytes):
+    """上传 PNG 到飞书图床 → image_key（multipart，标准库手写）。失败返回 None。"""
+    boundary = "----onelap" + uuid.uuid4().hex
+    bb = boundary.encode()
+    head = (b"--" + bb + b"\r\n"
+            + b'Content-Disposition: form-data; name="image_type"\r\n\r\nmessage\r\n'
+            + b"--" + bb + b"\r\n"
+            + b'Content-Disposition: form-data; name="image"; filename="chart.png"\r\n'
+            + b"Content-Type: image/png\r\n\r\n")
+    body = head + png_bytes + b"\r\n--" + bb + b"--\r\n"
+    req = urllib.request.Request("https://open.feishu.cn/open-apis/im/v1/images",
+        data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with _urlopen(req, 30) as r:
+            obj = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body_txt = ""
+        try:
+            body_txt = e.read().decode("utf-8", "replace")[:400]
+        except Exception:
+            pass
+        hint = ""
+        if "im:resource" in body_txt:
+            hint = "（飞书应用缺权限 im:resource:upload：去开放平台开通该权限并发布版本后生效；未开通时图表会跳过、卡片照发）"
+        print(f"飞书图片上传失败 HTTP {e.code}{hint}: {body_txt}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"飞书图片上传异常: {e}", file=sys.stderr)
+        return None
+    if obj.get("code") != 0:
+        print(f"飞书图片上传失败: {obj.get('msg') or obj}", file=sys.stderr)
+        return None
+    return (obj.get("data") or {}).get("image_key")
+
+
+def push_feishu(cfg, title, content, images=None):
+    """通过飞书自建应用（App ID/Secret）把互动卡片发到群。images=[png_bytes,...] 时先上传为
+    图片元素插到卡片顶部（训练图表）。成功返回 True。"""
+    app_id = (cfg.get("feishu_app_id") or "").strip()
+    app_secret = (cfg.get("feishu_app_secret") or "").strip()
+    if not app_id or not app_secret:
+        print("未配置 feishu_app_id/feishu_app_secret，跳过飞书推送。", file=sys.stderr)
+        return False
+    try:
+        token = _feishu_get_token(app_id, app_secret)
+        chat_id = _feishu_resolve_chat(token, cfg)
+    except ApiError as e:
+        print(f"飞书推送: {e}", file=sys.stderr)
+        return False
+    except urllib.error.URLError as e:
+        print(f"飞书推送网络错误: {e.reason}", file=sys.stderr)
+        return False
+    if not chat_id:
+        return False
+    elements = _feishu_card_elements(content)
+    if not elements:
+        elements = [{"tag": "markdown", "content": content[:28000]}]
+    # 训练图表（计划vs实际 TSS、PMC 体能/疲劳）上传为图片元素，插到卡片最前
+    if images:
+        img_elements = []
+        for png in images:
+            if not png:
+                continue
+            key = _feishu_upload_image(token, png)
+            if key:
+                img_elements.append({"tag": "img", "img_key": key,
+                                     "alt": {"tag": "plain_text", "content": "训练图表"}})
+        if img_elements:
+            elements = ([{"tag": "markdown", "content": "**📊 训练执行与负荷（数据图表）**"}]
+                        + img_elements + [{"tag": "hr"}] + elements)
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title[:100]},
+            "template": "indigo",
+            "subtitle": {"tag": "plain_text", "content": "AI 教练 · 每日训练分析"},
+        },
+        "elements": elements,
+    }
+    body = json.dumps({
+        "receive_id": chat_id,
+        "msg_type": "interactive",
+        "content": json.dumps(card, ensure_ascii=False),  # content 必须是 JSON 字符串
+    }).encode("utf-8")
+    url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+    req = urllib.request.Request(url, data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with _urlopen(req, 30) as r:
+            obj = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"飞书推送 HTTP {e.code}: {e.read().decode('utf-8','replace')[:200]}", file=sys.stderr)
+        return False
+    except urllib.error.URLError as e:
+        print(f"飞书推送网络错误: {e.reason}", file=sys.stderr)
+        return False
+    if obj.get("code") == 0:
+        print("✅ 报告已推送到飞书。", file=sys.stderr)
+        return True
+    print(f"飞书推送失败（需开权限 im:message）: {obj.get('msg') or obj}", file=sys.stderr)
+    return False
+
+
+def planned_tss_by_date(planned_items):
+    """汇总每日【计划】TSS → {ISO日期: tss}。planned_items 可为 planned_workouts() 输出
+    （date 为 date 对象、键 tss）或 list_planned_workouts 原始项（date 为字符串、键 TSS）。"""
+    out = {}
+    for p in planned_items or []:
+        d = p.get("date")
+        iso = d.isoformat() if hasattr(d, "isoformat") else str(d)[:10]
+        if len(iso) != 10:
+            continue
+        tss = to_num(first(p, "tss", "TSS", "tss_score", "load_tss")) or 0
+        out[iso] = out.get(iso, 0) + tss
+    return out
+
+
+def actual_tss_by_date(pmc_pts):
+    """汇总每日【实际】TSS → {ISO日期: tss}。pmc_items 元组 (date,ctl,atl,tsb,tss)。"""
+    out = {}
+    for d, _c, _a, _t, tss in (pmc_pts or []):
+        if tss is None:
+            continue
+        out[d.isoformat()] = out.get(d.isoformat(), 0) + float(tss)
+    return out
+
+
+def execution_rate(planned_by_date, actual_by_date, today, days_back=14):
+    """近 days_back 天（含今日）训练执行率。只对 planned>0 的训练日计算（休息/空档日不计分母，
+    避免休息日把分母撑大）。返回 {rate, planned_tss, actual_tss, train_days, rows[{date,planned,actual,rate}]}。"""
+    rows = []
+    tot_p = tot_a = 0.0
+    train_days = 0
+    for i in range(days_back):
+        iso = (today - timedelta(days=i)).isoformat()
+        p = float(planned_by_date.get(iso) or 0)
+        a = float(actual_by_date.get(iso) or 0)
+        if p <= 0:
+            continue  # 非训练日（休息/空档）：不进分母
+        tot_p += p
+        tot_a += a
+        train_days += 1
+        rows.append({"date": iso, "planned": p, "actual": a, "rate": a / p})
+    rate = (tot_a / tot_p) if tot_p > 0 else None
+    return {"rate": rate, "planned_tss": tot_p, "actual_tss": tot_a,
+            "train_days": train_days, "rows": rows}
+
+
+def build_report(pmc, rides, planned, training_plans, today, days_back, days_ahead, coach_md=None, coach_model="", weather=None, show_weekend=False, exec_rate=None):
     L = []
     L.append(f"# Onelap 训练分析报告  ·  {today.isoformat()}\n")
 
@@ -820,8 +2058,30 @@ def build_report(pmc, rides, planned, training_plans, today, days_back, days_ahe
     else:
         L.append(f"- 近 {days_back} 天没有骑行记录（可能是这几天确实没骑，或记录未同步）。\n")
 
-    # ---- 二、未来训练安排（glm-5.2 教练生成；OTM 课表为空时用此） ----
-    L.append(f"## 二、未来 {days_ahead} 天的训练安排\n")
+    # ---- 训练执行率（计划 vs 实际）----
+    if exec_rate and exec_rate.get("train_days"):
+        L.append(f"### 训练执行率（计划 vs 实际，近 {days_back} 天）\n")
+        r = exec_rate["rate"]
+        rate_txt = f"{r*100:.0f}%" if r is not None else "--"
+        flag = ("（⚠️ 偏低：计划没骑够——要么计划定高了，要么需要补骑）" if r is not None and r < 0.70
+                else "（⚠️ 偏高：实际远超计划，留意过载）" if r is not None and r > 1.15
+                else "（✅ 执行良好）" if r is not None else "")
+        L.append(f"- 训练日 {exec_rate['train_days']} 天：计划 TSS **{exec_rate['planned_tss']:.0f}** / "
+                 f"实际 **{exec_rate['actual_tss']:.0f}** → 执行率 **{rate_txt}**{flag}\n")
+        L.append("| 日期 | 计划TSS | 实际TSS | 完成 |")
+        L.append("|---|---|---|---|")
+        for row in sorted(exec_rate["rows"], key=lambda x: x["date"], reverse=True):
+            rr = row["rate"]
+            mark = "✅" if 0.70 <= rr <= 1.15 else ("⬇️" if rr < 0.70 else "⬆️")
+            L.append(f"| {row['date']} | {row['planned']:.0f} | {row['actual']:.0f} | {mark} {rr*100:.0f}% |")
+        L.append("")
+
+    # ---- 二、今日北京天气与户外训练适宜度（Open-Meteo；失败则省略） ----
+    if weather:
+        L.extend(render_weather_section(weather, today, show_weekend=show_weekend))
+
+    # ---- 三、未来训练安排（glm-5.2 教练生成；OTM 课表为空时用此） ----
+    L.append(f"## 三、未来 {days_ahead} 天的训练安排\n")
     if coach_md:
         L.append(f"> 以下计划由 {coach_model or 'GLM'}（角色：自行车教练）基于你上面的历史训练数据生成：\n")
         L.append(coach_md.strip())
@@ -884,8 +2144,31 @@ def zone_to_power(zone, if_score):
     return (60, 72)
 
 
+def _main_segments(zone, main_s, lo, hi, name):
+    """主体时段 → 段列表。Z5/Z6（VO2/无氧）拆成 on/off 微间歇并【封顶高强度总量】
+    （Z5≤18min、Z6≤8min 停留在目标区），其余主体时间用 Z2 耐力填充——
+    避免一次堆太多 VO2（户外也骑不下来），且总时长≈main_s。Z1/Z2/Z3/Z4/甜区 为连续块。"""
+    z = str(zone or "").strip()
+    if z in ("Z5", "Z6"):
+        on = 180 if z == "Z5" else 60            # Z5: 3min 冲；Z6: 1min 冲
+        off = 120 if z == "Z5" else 180           # Z5: 2min 恢复；Z6: 3min 恢复
+        cap = (18 * 60) if z == "Z5" else (8 * 60)  # 高强度累计上限
+        segs, on_total, i = [], 0, 1
+        while on_total + on <= cap and on_total + on + off <= main_s:
+            segs.append({"name": f"{name}·冲{i}", "duration_s": on, "lo": lo, "hi": hi})
+            segs.append({"name": f"恢复{i}", "duration_s": off, "lo": 50, "hi": 60})
+            on_total += on
+            i += 1
+        used = sum(s["duration_s"] for s in segs)
+        if main_s - used > 60:                    # 剩余时间用 Z2 耐力填充（保证总时长≈main_s）
+            segs.append({"name": "耐力填充", "duration_s": main_s - used, "lo": 60, "hi": 72})
+        return segs or [{"name": name, "duration_s": main_s, "lo": lo, "hi": hi}]
+    return [{"name": name, "duration_s": main_s, "lo": lo, "hi": hi}]
+
+
 def build_intervals(day):
-    """计划日 → 间歇段列表 [{name, duration_s, lo, hi}]。休息日返回空。"""
+    """计划日 → 间歇段列表 [{name, duration_s, lo, hi}]。休息日返回空。
+    Z5/Z6（VO2/无氧）主体拆成 on/off 微间歇（路骑可执行、且封顶高强度量）；其余强度为连续块。"""
     if day["action"] == "rest" or day["duration_min"] <= 0:
         return []
     total = day["duration_min"] * 60
@@ -896,7 +2179,7 @@ def build_intervals(day):
     segs = []
     if warmup > 0:
         segs.append({"name": "热身", "duration_s": warmup, "lo": 50, "hi": min(60, lo)})
-    segs.append({"name": day["name"] or "主体", "duration_s": main, "lo": lo, "hi": hi})
+    segs.extend(_main_segments(day["zone"], main, lo, hi, day["name"] or "主体"))
     if cooldown > 0:
         segs.append({"name": "放松", "duration_s": cooldown, "lo": 45, "hi": 60})
     return segs
@@ -1003,18 +2286,112 @@ def import_plan(cfg, days, dry_run=True, test_date=None):
             results.append({"date": day["date"].isoformat(), "name": day["name"],
                             "segments": segs, "target_tss": day["tss"]})
             continue
+        # 拆成「创建」与「排期」两步：排期失败时回滚已建的课，避免 OTM 训练库
+        # 累积未排期的「（计划）」孤儿课（cleanup_future_plan 只扫已排期课，看不到孤儿）。
         try:
             res = create_workout(cfg, build_workout_payload(day))
-            wid = (res or {}).get("wid") or (res or {}).get("id") or (res or {}).get("_id")
-            if wid:
-                assign_plan(cfg, wid, day["date"].isoformat())
-            print(f"  [OK]  {day['date']} {day['name']} → wid={wid}", file=sys.stderr)
-            results.append({"date": day["date"].isoformat(), "name": day["name"],
-                            "wid": wid, "response": res})
         except ApiError as e:
-            print(f"  [FAIL] {day['date']} {day['name']}: {e}", file=sys.stderr)
-            results.append({"date": day["date"].isoformat(), "name": day["name"], "error": str(e)})
+            print(f"  [FAIL] {day['date']} {day['name']} 创建课失败: {e}", file=sys.stderr)
+            results.append({"date": day["date"].isoformat(), "name": day["name"],
+                            "error": f"创建失败: {e}"})
+            continue
+        wid = (res or {}).get("wid") or (res or {}).get("id") or (res or {}).get("_id")
+        if not wid:
+            print(f"  [FAIL] {day['date']} {day['name']} 创建课未返回 wid: {res}", file=sys.stderr)
+            results.append({"date": day["date"].isoformat(), "name": day["name"],
+                            "error": f"无 wid: {res}"})
+            continue
+        try:
+            assign_plan(cfg, wid, day["date"].isoformat())
+        except ApiError as e:
+            try:
+                delete_workout(cfg, wid)
+                log(f"  排期失败，已回滚删除 wid={wid}：{e}")
+                rolled = True
+            except ApiError as de:
+                log(f"  ⚠️ 排期失败且回滚删除也失败 wid={wid}：{de}（训练库可能残留孤儿课，需手动清）")
+                rolled = False
+            print(f"  [FAIL] {day['date']} {day['name']} 排期失败"
+                  f"{'（已回滚）' if rolled else '（回滚失败，请手动清理训练库）'}: {e}", file=sys.stderr)
+            results.append({"date": day["date"].isoformat(), "name": day["name"], "wid": wid,
+                            "rolled_back": rolled, "error": f"排期失败: {e}"})
+            continue
+        print(f"  [OK]  {day['date']} {day['name']} → wid={wid}", file=sys.stderr)
+        results.append({"date": day["date"].isoformat(), "name": day["name"],
+                        "wid": wid, "response": res})
     return results
+
+
+def _import_ok_count(results):
+    """数导入成功的天数：有 wid 且无 error（创建失败/无 wid/排期失败/回滚失败都带 error，不算成功）。
+    休息日不进 results，故成功率的分母应取 len(results) 而非计划总天数。"""
+    return len([r for r in results if r.get("wid") and not r.get("error")])
+
+
+# ---------------------------------------------------------------------------
+# 休息日 flag（用户标记）/ 计划降频复用 / 按日清理与读取
+# ---------------------------------------------------------------------------
+def load_rest_flags():
+    """读 rest_flags.json → set of 'YYYY-MM-DD'。"""
+    try:
+        d = json.load(open(REST_FLAGS, encoding="utf-8"))
+        return set(str(x) for x in (d.get("rest_dates") or []))
+    except Exception:
+        return set()
+
+
+def save_rest_flags(dates):
+    """原子写回休息日集合（升序）。"""
+    dates = sorted(set(str(x) for x in dates))
+    tmp = REST_FLAGS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"rest_dates": dates}, f, ensure_ascii=False)
+    os.replace(tmp, REST_FLAGS)
+
+
+def mark_rest(date_iso, clear=False):
+    """标记/取消某日为休息。返回当前是否仍为休息。"""
+    flags = load_rest_flags()
+    if clear:
+        flags.discard(date_iso)
+    else:
+        flags.add(date_iso)
+    save_rest_flags(flags)
+    return date_iso in flags
+
+
+def read_date_flag(path):
+    """读一个写有 'YYYY-MM-DD' 的标志文件 → date 或 None。"""
+    try:
+        return parse_date(open(path, encoding="utf-8").read().strip())
+    except Exception:
+        return None
+
+
+def cleanup_plan_on_date(cfg, date_iso):
+    """删除某日日历上【脚本导入的】（计划）课。返回删除数。用户手建的课不动。"""
+    n = 0
+    for p in list_planned_workouts(cfg):
+        if PLAN_MARKER not in str(p.get("name", "")):
+            continue
+        if str(p.get("date", ""))[:10] == date_iso:
+            try:
+                delete_workout(cfg, p.get("wid"))
+                n += 1
+                log(f"  删除休息日计划课 wid={p.get('wid')} ({p.get('name')}, {date_iso})")
+            except ApiError as e:
+                log(f"  删除 wid={p.get('wid')} 失败: {e}")
+    return n
+
+
+def get_plan_on_date(cfg, date_iso):
+    """读某日日历上排定的训练课（list[dict]，含用户手建+脚本导入）。"""
+    out = []
+    for p in list_planned_workouts(cfg):
+        if str(p.get("date", ""))[:10] == date_iso:
+            out.append(p)
+    return out
+
 
 
 # ---------------------------------------------------------------------------
@@ -1048,7 +2425,7 @@ def sample_data(today):
 def main():
     ap = argparse.ArgumentParser(description="Onelap OTM 训练分析报告")
     ap.add_argument("--days-back", type=int, default=14, help="回看几天（默认 14）")
-    ap.add_argument("--days-ahead", type=int, default=14, help="展望几天（默认 14）")
+    ap.add_argument("--days-ahead", type=int, default=None, help="展望几天（没传则读 config.json 的 days_ahead，默认 14）")
     ap.add_argument("--raw", action="store_true", help="原始 JSON 落盘（调试用）")
     ap.add_argument("--sample", action="store_true", help="用假数据预览，不联网")
     ap.add_argument("--no-coach", action="store_true", help="不调用 glm-5.2 教练生成计划")
@@ -1058,19 +2435,103 @@ def main():
     ap.add_argument("--import-test-date", metavar="YYYY-MM-DD", help="只在该日期创建 1 条训练课（实测验证）")
     ap.add_argument("--import", dest="do_import", action="store_true", help="把计划批量写入 OTM 日历")
     ap.add_argument("--auto", action="store_true",
-                    help="每日自动模式（cron 用）：刷新token→抓数据→生成计划→删旧计划→导入→推送→写日志")
+                    help="每日自动模式（readiness 上传触发 / 可选 cron 兜底）：刷新token→抓数据→生成计划→删旧→导入→推送→写日志")
     ap.add_argument("--start-today", action="store_true", help="计划从今天起（默认从明天起）；--auto 默认开启")
     ap.add_argument("--no-cleanup", action="store_true", help="--auto 时导入前不删除旧的「（计划）」课")
     ap.add_argument("--retries", type=int, default=12, help="--auto 时教练 LLM 调用失败的重试次数（默认 12）")
+    ap.add_argument("--force", action="store_true", help="强制再跑一次 --auto（忽略「今日已运行」防重复，调试用）")
+    ap.add_argument("--no-weather", action="store_true", help="跳过北京各区天气抓取")
+    ap.add_argument("--weather-only", action="store_true",
+                    help="只抓天气并打印适宜度表后退出（不联网 OTM、不调 LLM，验证用）")
+    ap.add_argument("--show-weekend", action="store_true",
+                    help="强制展示「周末去哪骑」（平时仅周五/节假日自动触发；调试/预览用）")
+    ap.add_argument("--regen", action="store_true",
+                    help="强制重新生成 AI 计划（忽略降频复用，单次跑仍调教练）")
+    ap.add_argument("--rest", metavar="DATE", nargs="?", const="tomorrow",
+                    help="标记某日为休息日（默认明天；可给 YYYY-MM-DD 或 today），写入 rest_flags 后退出。"
+                         "标记今日会立即删除当日计划课。取消用 --rest-clear")
+    ap.add_argument("--rest-clear", metavar="DATE", nargs="?", const="all",
+                    help="取消休息日标记（给日期或 all 全清）后退出")
     args = ap.parse_args()
+
+    # --days-ahead：命令行优先；没传就读 config.json 的 days_ahead，再默认 14
+    if args.days_ahead is None:
+        try:
+            _c = json.load(open(os.path.join(HERE, "config.json"), encoding="utf-8"))
+        except Exception:
+            _c = {}
+        args.days_ahead = int(_c.get("days_ahead", 14) or 14)
 
     today = date.today()
     cfg = {}
     coach_md = None
     coach_plan = None
+    weather = None
+    show_weekend = False
+    exec_rate = None
+    charts = []
+
+    # --weather-only：只抓天气并打印，不联网 OTM、不调 LLM（最快验证天气链路）
+    if args.weather_only:
+        _c = {}
+        _home = None
+        try:
+            _c = json.load(open(os.path.join(HERE, "config.json"), encoding="utf-8"))
+            _home = _c.get("home_district")
+        except Exception:
+            pass
+        _wk = args.show_weekend or weather_show_weekend(today, _c)
+        print("正在抓取北京各区实时天气（Open-Meteo，免费无 key）……", file=sys.stderr)
+        weather = get_beijing_weather(today, weather_fetch_days(today, _wk), _home)
+        if not weather:
+            print("天气获取失败（网络/接口），可加 --no-weather 跳过。", file=sys.stderr)
+            sys.exit(1)
+        print("\n" + "\n".join(render_weather_section(weather, today, show_weekend=_wk)))
+        print("\n**全 16 区明细**\n")
+        print("\n".join(weather_full_table_lines(weather)))
+        return
+
+    # --rest / --rest-clear：标记/取消休息日（标记今日会立即删当日计划课），完成后退出
+    if args.rest is not None or args.rest_clear is not None:
+        _cfg = load_config() if os.path.exists(CONFIG_PATH) else {}
+        if args.rest is not None:
+            _d = args.rest
+            _rd = (today.isoformat() if _d == "today"
+                   else (today + timedelta(days=1)).isoformat() if _d == "tomorrow" else _d)
+            if not parse_date(_rd):
+                print(f"日期格式不对：{_rd}（应为 YYYY-MM-DD / today / tomorrow）", file=sys.stderr)
+                sys.exit(1)
+            mark_rest(_rd)
+            msg = f"✅ 已标记 {_rd} 为休息日。该日 --auto 会跳过 AI、移除当日计划课。"
+            if _rd == today.isoformat():
+                try:
+                    msg += f" 已立即删除当日 {cleanup_plan_on_date(_cfg, _rd)} 节计划课。"
+                except Exception as e:
+                    msg += f" 删除当日课失败：{e}"
+            print(msg, file=sys.stderr)
+        else:
+            _d = args.rest_clear
+            if _d == "all":
+                save_rest_flags([])
+                print("✅ 已清空所有休息日标记。", file=sys.stderr)
+            else:
+                mark_rest(_d, clear=True)
+                print(f"✅ 已取消 {_d} 的休息日标记。", file=sys.stderr)
+        return
 
     # --auto：一站式每日流程（刷新 token / 推送 / 导入 / 从今天起 / 写日志）
     if args.auto:
+        _AUTO_CRASH_CTX.update(auto=True, done=False, today=today.isoformat(), cfg={})  # 崩溃兜底用
+        # 每日只自动跑一次（避免「早晨触发 + 备份 cron」同日重复）；--force 可强制重跑
+        _guard = os.path.join(HERE, "last_auto_run.txt")
+        if not getattr(args, "force", False):
+            try:
+                if open(_guard, encoding="utf-8").read().strip() == today.isoformat():
+                    log(f"今日已自动运行过（{today.isoformat()}），跳过。强制重跑请加 --force。")
+                    _AUTO_CRASH_CTX["done"] = True  # 正常跳过，不算崩溃
+                    return
+            except FileNotFoundError:
+                pass
         os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)  # 供 cron 重定向 logs/auto.log
         args.push = True
         args.do_import = True
@@ -1085,15 +2546,30 @@ def main():
         rides = ride_items(rides_raw)
         planned = planned_workouts(planned_raw)
         training_plans = {}
+        weather = sample_weather(today)
+        show_weekend = True  # 样例预览展示「周末去哪骑」
+        _pmc = pmc_items(pmc_raw)
     else:
         cfg = load_config()
         append_readiness_history(load_readiness())  # 记今日 readiness 进历史，供算个人基线
+        _AUTO_CRASH_CTX["cfg"] = cfg  # 让崩溃兜底告警能拿到配置（含推送 key）
         if args.auto:
             try:
                 cfg, refreshed = refresh_access_token(cfg)
                 log(f"token {'已刷新并写回 config' if refreshed else '未配 refresh_token，沿用静态 token'}")
             except ApiError as e:
                 log(f"token 刷新失败：{e}（沿用旧 token，若已过期后续会 401）")
+                push_alert(cfg, "⚠️ OTM token 刷新失败",
+                           f"refresh_token 可能已失效（旧 access token 约 48h 后过期）。\n"
+                           f"错误：{e}\n请尽快重新登录 otm.onelap.cn 并更新 config.json 的 "
+                           f"token / refresh_token，否则自动流程会断档。")
+        # 同步 OTM 账号 FTP/MHR/LTHR/体重（只读；失败不阻断，沿用 config 值）
+        try:
+            _info = get_userinfo(cfg)
+            if _info:
+                sync_physiology_from_otm(cfg, _info)
+        except Exception as e:
+            log(f"OTM 生理数据同步失败，沿用 config 值：{e}")
         pmc_start = (today - timedelta(days=45)).isoformat()
         pmc_end = (today + timedelta(days=2)).isoformat()
         cal_start = (today - timedelta(days=args.days_back)).isoformat()
@@ -1112,19 +2588,72 @@ def main():
         print(f"  PMC {len(pmc_raw)} 点；骑行记录 {len(rides_raw)} 条；"
               f"课表 workout/list 已取。", file=sys.stderr)
 
+        # 北京各区天气（Open-Meteo，免费无 key；失败不阻断主流程）
+        if not args.no_weather:
+            try:
+                show_weekend = args.show_weekend or weather_show_weekend(today, cfg)
+                print("正在抓取北京各区天气……"
+                      f"{'（含周末预报）' if show_weekend else ''}", file=sys.stderr)
+                weather = get_beijing_weather(today, weather_fetch_days(today, show_weekend),
+                                             cfg.get("home_district"))
+                if weather:
+                    _ht = "、".join(f"{h['name']}={h.get('suit_tag', '?')}"
+                                    for h in (weather.get("home_points") or []))
+                    print(f"  天气已取：常骑点 {_ht}", file=sys.stderr)
+            except Exception as e:
+                log(f"天气获取失败，跳过：{e}")
+                weather = None
+
         if args.raw:
             with open(os.path.join(HERE, f"data_{today.isoformat()}.json"), "w", encoding="utf-8") as f:
                 json.dump({"pmc": pmc_raw, "rides": rides_raw,
-                           "calendar": cal_raw, "training_plans": training_plans},
-                          f, ensure_ascii=False, indent=2)
+                           "calendar": cal_raw, "training_plans": training_plans,
+                           "weather": weather},
+                          f, ensure_ascii=False, indent=2, default=str)
             print(f"  原始数据已写入：data_{today.isoformat()}.json", file=sys.stderr)
 
         rides = ride_items(rides_raw)
         planned = planned_workouts(cal_raw)
+        _pmc = pmc_items(pmc_raw)  # 规整一次，供教练 prompt / TSB 投影 / 报告共用（避免重复解析、避免三处不一致）
+        try:  # 训练执行率：计划 TSS（课表）vs 实际 TSS（PMC），近 days_back 天
+            exec_rate = execution_rate(planned_tss_by_date(planned), actual_tss_by_date(_pmc),
+                                       today, days_back=args.days_back)
+        except Exception as e:
+            log(f"执行率计算失败，跳过：{e}")
+            exec_rate = None
+        # 训练图表（飞书卡片用，需 Pillow；无 Pillow/失败则跳过，不影响主流程）
+        if HAVE_PIL:
+            try:
+                _rows = _planned_actual_rows(planned_tss_by_date(planned), actual_tss_by_date(_pmc),
+                                             today, days_back=min(args.days_back, 21))
+                _p1 = chart_planned_vs_actual(_rows, f"计划 vs 实际 TSS（近 {len(_rows)} 天）")
+                _p2 = chart_pmc_load(_pmc[-45:])
+                charts = [p for p in (_p1, _p2) if p]
+            except Exception as e:
+                log(f"图表生成失败，跳过：{e}")
+                charts = []
 
-        # glm-5.2 教练生成计划（config.json 里填了 glm_api_key 就启用）
-        if not args.no_coach and (cfg.get("glm_api_key") or "").strip():
-            system, user = build_coach_prompt(cfg, pmc_items(pmc_raw), rides, today, args.days_ahead,
+        # —— 模式判定：休息 / 再生 / 复用 ——
+        # 休息日(用户标记)→跳过AI、删当日课；降频复用→未到刷新间隔则跳过AI、保留日历既有计划。
+        rest_dates = load_rest_flags()
+        is_rest = today.isoformat() in rest_dates
+        _last_gen = read_date_flag(PLAN_GEN_FLAG)
+        _refresh = int(cfg.get("plan_refresh_days", 3) or 3)
+        do_regen = (not is_rest) and (args.regen or not args.auto or not _last_gen
+                                      or (_last_gen and (today - _last_gen).days >= _refresh))
+        if is_rest:
+            log("🛌 今日为休息日（你标记），跳过 AI 计划。")
+            try:
+                cleanup_plan_on_date(cfg, today.isoformat())
+            except Exception as e:
+                log(f"删除今日计划课失败: {e}")
+            coach_md = ("🛌 **今日休息**（你标记的休息日）。\n\n"
+                        "已从 OTM 日历移除今日训练课。优先睡眠与恢复，明日按计划继续。")
+            coach_plan = None
+            args.do_import = False
+            args.dry_run_import = False
+        elif do_regen and not args.no_coach and (cfg.get("glm_api_key") or "").strip():
+            system, user = build_coach_prompt(cfg, _pmc, rides, today, args.days_ahead,
                                               start_date=start_date)
             attempts = (args.retries if args.retries and args.retries > 0 else 12) if args.auto else 1
             raw = None
@@ -1144,12 +2673,66 @@ def main():
                         log(f"教练调用最终失败：{e}")
             if raw:
                 coach_md, coach_plan = parse_coach_response(raw)
+                try:
+                    open(PLAN_GEN_FLAG, "w", encoding="utf-8").write(today.isoformat())
+                except Exception:
+                    pass
+                # 计划自洽校验：按生成的 TSS 用 PMC 公式前向推演 TSB，过载则告警（不调 LLM，0 额外 token）
+                try:
+                    _past = [x for x in _pmc if x[0] <= today]
+                    if _past and coach_plan:
+                        _, _ctl, _atl, _, _ = _past[-1]
+                        _proj = project_tsb(normalize_plan_days(coach_plan, today, args.days_ahead, start_date=start_date),
+                                            _ctl, _atl)
+                        if _proj:
+                            _fin, _min_tsb = _proj[-1], min(p["tsb"] for p in _proj)
+                            _line = (f"\n\n📈 **计划自洽校验**（按上方 TSS 用 PMC 公式前向推演）："
+                                     f"预计 {len(_proj)} 日后 CTL {_fin['ctl']:.0f} / ATL {_fin['atl']:.0f} "
+                                     f"/ TSB {_fin['tsb']:.0f}；窗口内最低 TSB {_min_tsb:.0f}。")
+                            if _min_tsb < -20 or _fin["tsb"] < -25:
+                                _line += "\n⚠️ **过载风险**：推演 TSB 偏低，建议下调强度日 TSS 或加恢复日。"
+                            coach_md = (coach_md or "") + _line
+                except Exception as e:
+                    log(f"TSB 前向投影失败，跳过：{e}")
             else:
                 coach_md, coach_plan = None, None
+        elif do_regen:
+            # 到了刷新日但没配 glm key / --no-coach：无计划
+            coach_md, coach_plan = None, None
+        else:
+            # 复用模式：跳过 AI，保留 OTM 日历既有计划，只读今日课展示
+            log(f"📋 计划复用（上次生成 {_last_gen}，未满 {_refresh} 天），跳过 AI 省 token。")
+            try:
+                _tp = get_plan_on_date(cfg, today.isoformat())
+            except Exception as e:
+                log(f"读取今日日历课失败：{e}")
+                _tp = []
+            if _tp:
+                _det = "\n".join(f"- {first(p, 'name', 'Name', default='?')}："
+                                 f"TSS {first(p, 'TSS', 'tss', default='?')}，"
+                                 f"时长 {human_duration(first(p, 'duration', 'duration_s'))}" for p in _tp)
+                coach_md = (f"📋 **今日训练（沿用 {_last_gen} 生成的计划，未调用 AI 省 token）**\n\n"
+                            f"OTM 日历今日排定：\n{_det}")
+            else:
+                coach_md = f"📋 今日无训练课（沿用 {_last_gen} 起的计划周期，本日为休息/空档）。"
+            coach_plan = None
+            args.do_import = False
+            args.dry_run_import = False
 
-    report = build_report(pmc_items(pmc_raw), rides, planned, training_plans,
+    # 目标日期驱动的阶段建议（基于 target_event/target_date；phase_autosync 控制是否写回 config）
+    try:
+        _phase_adv = phase_advisory(cfg, today)
+    except Exception as e:
+        _phase_adv = None
+        if args.auto:
+            log(f"阶段建议计算失败，跳过：{e}")
+    if _phase_adv:
+        coach_md = (coach_md + "\n\n" + _phase_adv) if coach_md else _phase_adv
+
+    report = build_report(_pmc, rides, planned, training_plans,
                           today, args.days_back, args.days_ahead,
-                          coach_md=coach_md, coach_model=COACH_MODEL)
+                          coach_md=coach_md, coach_model=COACH_MODEL,
+                          weather=weather, show_weekend=show_weekend, exec_rate=exec_rate)
     print("\n" + report)
 
     if not args.no_save:
@@ -1159,7 +2742,8 @@ def main():
         print(f"\n（报告已保存：{out}）", file=sys.stderr)
 
     if args.push:
-        push_serverchan(cfg, f"Onelap训练报告 {today.isoformat()}", report)
+        _title = f"Onelap训练报告 {today.isoformat()}"
+        push_alert(cfg, _title, report, images=charts)  # 复用告警通道（带 key 校验 + 异常兜底，图表只发飞书）
 
     # 导入 OTM（dry-run / 测1条 / 批量）
     if args.dry_run_import or args.import_test_date or args.do_import:
@@ -1184,9 +2768,9 @@ def main():
                 label = "预览(dry-run)" if dry else ("测试写入1条" if td else "批量写入")
                 print(f"\n准备{label} {len(days)} 天计划中的训练日……", file=sys.stderr)
                 results = import_plan(cfg, days, dry_run=dry, test_date=td)
-                ok_n = len([r for r in results if r.get("wid")])
+                ok_n = _import_ok_count(results)  # 有 wid 且无 error 才算成功（回滚失败也排除）
                 if args.auto:
-                    log(f"导入完成：成功 {ok_n}/{len(days)} 天")
+                    log(f"导入完成：成功 {ok_n}/{len(results)} 天")  # 分母=实际尝试的训练日（休息日不计）
                 if not dry:
                     p = os.path.join(HERE, f"imported_{today.isoformat()}.json")
                     with open(p, "w", encoding="utf-8") as f:
@@ -1194,6 +2778,12 @@ def main():
                     print(f"导入结果已记录：{p}", file=sys.stderr)
 
     if args.auto:
+        try:
+            open(os.path.join(HERE, "last_auto_run.txt"), "w", encoding="utf-8").write(today.isoformat())
+        except Exception:
+            pass
+        _AUTO_CRASH_CTX["done"] = True  # 正常完成，抑制崩溃兜底告警
+        _AUTO_CRASH_CTX["cfg"] = {}      # 清掉 cfg 引用（不再需要）
         log("==== 自动运行结束 ====\n")
 
 

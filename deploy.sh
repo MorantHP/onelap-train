@@ -3,7 +3,7 @@
 # onelap-train 一键部署脚本（Alibaba Cloud Linux 3 / 任意 RHEL 系）
 # 在全新的 ECS 上以 root 运行：  sudo bash deploy.sh
 #
-# 做的事：装 Python≥3.7 → 取代码 → 配 config → systemd 常驻 receiver → cron 每天4点 → 防火墙 → 自测
+# 做的事：装 Python≥3.7 → 取代码 → 配 config → systemd 常驻 receiver(readiness 上传触发 --auto) → 清旧 cron → 防火墙 → 自测
 # 幂等：可重复运行，不会破坏已有 config.json 的密钥。
 # ============================================================================
 set -uo pipefail
@@ -115,12 +115,15 @@ systemctl enable --now onelap-readiness
 systemctl --no-pager --lines=3 status onelap-readiness 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
-c_blue "==== 6/8  cron：每天 04:00 跑 onelap_report.py --auto（北京时间）===="
-# 时区先设成上海（否则 cron 不是北京时间）
-timedatectl set-timezone Asia/Shanghai 2>/dev/null || true
-( crontab -l 2>/dev/null | grep -v 'onelap_report.py --auto' \
-; echo "0 4 * * * cd $APP_DIR && mkdir -p logs && $PY_ABS onelap_report.py --auto >> logs/auto.log 2>&1" ) | crontab -
-c_green "已安装 cron 任务："; crontab -l | grep onelap_report || true
+c_blue "==== 6/8  触发方式：仅 readiness 上传触发（不装 cron）===="
+# --auto 只在 readiness 数据到达时由 onelap-readiness 服务后台触发(config.readiness_trigger_auto=true)。
+# 好处：没上传 readiness 的日子不跑、0 token，日历保留上次计划。
+# 先清掉可能存在的旧 onelap cron（之前版本装过的备份任务）：
+( crontab -l 2>/dev/null | grep -v 'onelap_report.py --auto' ) | crontab - 2>/dev/null || true
+c_green "已确保无 onelap cron；每日 --auto 仅靠 readiness 上传触发。"
+# —— 若想要「即使没上传也兜底跑一次」的备份 cron，取消下面注释（每天 10:00 北京时间）——
+# timedatectl set-timezone Asia/Shanghai 2>/dev/null || true
+# ( crontab -l 2>/dev/null | grep -v 'onelap_report.py --auto' ; echo "0 10 * * * cd $APP_DIR && mkdir -p logs && $PY_ABS onelap_report.py --auto >> logs/auto.log 2>&1" ) | crontab -
 
 # ----------------------------------------------------------------------------
 c_blue "==== 7/8  放行端口 $PORT ===="

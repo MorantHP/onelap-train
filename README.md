@@ -10,15 +10,51 @@
 
 ## 它做什么
 
-每天定时（如凌晨 4 点）跑一遍 `--auto`，自动完成：
+每天**上传 readiness 后触发** `--auto`（不装 cron，没上传就不跑），自动完成：
 
 1. **刷新 token**（用 refresh_token 续期 access token，写回 config）。
 2. **抓取最新数据**：PMC 每日点 + 近 30 天骑行记录（TSS / 距离 / 时长 / 功率 / 心率）。
-3. **glm-5.2 教练生成计划**：基于当前疲劳状态生成从今天起 14 天的逐日计划（含 IF / TSS / 功率分区 Z1–Z5 / 甜区），失败自动重试。
-4. **删旧计划**：清理日历上之前导入的、带「（计划）」后缀的未来课（**只动脚本自己造的，你手建的不动**）。
-5. **导入新计划**：把每天翻译成间歇训练课（热身 + 主体 + 放松，按 %FTP）写入 OTM 日历。
-6. **推送微信**：经 Server酱 把完整报告推到你手机。
-7. **写日志**：全程带时间戳落到 `logs/auto.log`。
+3. **抓取北京各区天气**：按经纬度查 Open-Meteo（**免费无 key**）取 16 区 + 你的常骑点当日天气与实时 AQI，给出**户外骑行适宜度**（宜 / 注意 / 不宜户外）。天气仅供建议，**是否训练由你决定**。
+4. **glm-5.2 教练生成计划**：综合疲劳状态与 readiness 生成从今天起 14 天的逐日计划（含 IF / TSS / 功率分区 Z1–Z5 / 甜区），失败自动重试。
+5. **删旧计划**：清理日历上之前导入的、带「（计划）」后缀的未来课（**只动脚本自己造的，你手建的不动**）。
+6. **导入新计划**：把每天翻译成间歇训练课（热身 + 主体 + 放松，按 %FTP）写入 OTM 日历。
+7. **推送微信**：经 Server酱 把完整报告推到你手机。
+8. **写日志**：全程带时间戳落到 `logs/auto.log`。
+
+---
+
+## 系统架构 / 数据流
+
+**训练闭环**（端到端自动，从醒来到下次自适应）：
+
+```text
+Apple Watch readiness
+      │  iPhone 快捷指令 POST /readiness
+      ▼
+readiness_server.py (服务器:8079) ──触发──► onelap_report.py --auto
+                                                │
+        ┌───────────────────────────────────────┤
+        ▼                                       ▼
+ 刷新 OTM token                            glm-5.2 教练排 14 天计划
+ 抓 PMC / 骑行 / 天气                      （读 readiness + PMC + 执行率 + TSB 投影）
+        │                                       │
+        ▼                                       ▼
+ OTM 日历 ◄──── 写入训练课（Z5/Z6 已拆微间歇，路骑可执行）────┘
+        │
+        ▼
+ 顽鹿运动 App ──蓝牙同步──► 迈金 706 码表
+                              │（路骑：码表按 %FTP 引导间歇）
+                              ▼
+                       706 记录骑行 → 顽鹿 → OTM
+                              │
+        ┌─────────────────────┴───────────────┐
+        ▼                                     ▼
+ 报告推送                                  下次 --auto 读 PMC +
+ 飞书卡片📊（计划vs实际图表 +              算「计划vs实际执行率」→
+ CTL/ATL 趋势）+ Server酱 + 崩溃告警        教练自适应（闭环）
+```
+
+**部署拓扑**：iPhone → `readiness_server`（服务器 `lfy`，systemd 守护，`0.0.0.0:8079`，Bearer token 鉴权）→ `onelap_report.py --auto` → 对外调用 OTM API / 智谱 glm-5.2 / Open-Meteo 天气 / Server酱 / 飞书开放平台。码表侧经 **顽鹿运动 App** 与 OTM 同一生态双向同步（这也是骑行数据能进 OTM 的链路）。`config.json`（gitignore）持有 token / refresh_token / 各 API key。
 
 ---
 
@@ -81,18 +117,37 @@ readiness 数据怎么自动来？用 **iPhone「快捷指令」每天早晨把 
 
 ---
 
+## 北京天气与户外适宜度（可选，开箱即用）
+
+报告自动带上**北京 16 区当日天气 + 实时 AQI + 紫外线 + 风向风速**，以及你常骑点的逐时段天气，并给出**户外骑行适宜度**（绿「宜」/ 黄「注意」/ 红「不宜户外」），依据：体感最高温（≥38℃ 热射病风险）、降水概率、风速、恶劣天气（雷阵雨/冰雹/大雨）、AQI（>150 不健康）。数据走 [Open-Meteo](https://open-meteo.com)，**免费、无需 key、无需任何配置**。
+
+在 `config.json` 设 `home_district` 锚定工作日最常骑的地点（脚本内置 `南海子公园`、`戒台寺` 坐标，逗号分隔可填多个；也可填 16 区名如 `朝阳`/`海淀`/`大兴`）。周末还会列出近/远郊热点（门头沟 / 怀柔 / 延庆 / 密云 / 平谷 / 昌平 / 房山 / 顺义 / 大兴 / 通州）两天天气，方便挑路线。
+
+> 天气仅供**你自己参考**——北京预报常不准，所以**天气不参与教练排课**，教练只看 PMC + 骑行 + readiness；是否训练、怎么调整时段/室内外，由你看过天气后自己决定。单独看天气：`python onelap_report.py --weather-only`。
+
+---
+
+## 省 token：休息日跳过 + 降频复用
+
+AI 教练（glm-5.2）是主要 token 开销。两个机制大幅降低消耗：
+
+1. **降频复用**（`config.json` 的 `plan_refresh_days`，默认 3）：`--auto` 不是每天重排，而是**每 N 天**才调一次教练重新排课；间隔内的日子**复用 OTM 日历上既有的计划**（只读今日课展示，不调 AI、不动日历）。想立刻重排可加 `--regen`。
+2. **休息日跳过**（0 token）：标记某日为休息后，该日 `--auto` **完全不调教练**，并移除当日训练课。标记方式：
+   - 命令行：`python onelap_report.py --rest`（默认标记明天）/ `--rest today` / `--rest 2026-08-01`；取消用 `--rest-clear all`。
+   - **一键触发**（推荐）：readiness 接收端的 `POST /override`（见 DEPLOY.md），用 iPhone 快捷指令 / curl 一键标记「明日休息」。
+
+> 模式优先级：**休息日 > 到期再生 > 复用**。休息日无论如何都跳过 AI。
+
+---
+
 ## 每日自动运行
 
-详细部署见 **[DEPLOY.md](DEPLOY.md)**（含排错表）。两平台要点：
+**触发方式：上传 readiness 即触发**（推荐）。配好 `readiness_server.py` + `config.json` 的 `readiness_trigger_auto: true` 后，每天早晨你用 iPhone 快捷指令把 Apple Watch 数据 POST 上来，服务端就**自动后台跑一次 `--auto`**——醒来即出当天报告。**没上传 readiness 的日子不跑**（日历保留上次计划，0 token）。
 
-- **Linux（cron）**：
-  ```cron
-  0 4 * * * cd /opt/onelap-train && mkdir -p logs && /usr/bin/python3 onelap_report.py --auto >> logs/auto.log 2>&1
-  ```
-  （服务器时区设为 `Asia/Shanghai` 即北京 4 点）
+- 详见 **[DEPLOY.md](DEPLOY.md)**（含排错表 + 快捷指令配方）。
+- **可选备份 cron**：如果你担心某天忘传 readiness 而漏跑，可加一条每天定时兜底的 cron（DEPLOY.md 有命令）。默认不装。
 
-- **Windows（任务计划程序）**：用仓库里的 `run_auto.bat`，建一个每天 04:00 触发的任务调用它。详见 DEPLOY.md「Windows 部署」章节。
-
+> `--auto` 自带「每日只跑一次」防重复（`last_auto_run.txt`），所以 readiness 多次上传或叠加备份 cron 都不会重复跑。
 > 部分服务器网络有 TLS 拦截，脚本已内置 SSL 容错（证书校验失败时自动回退并警告一次）。
 
 ---
@@ -112,6 +167,11 @@ readiness 数据怎么自动来？用 **iPhone「快捷指令」每天早晨把 
 | `--dry-run-import` | 预览导入的训练课（不写入，安全） |
 | `--import-test-date YYYY-MM-DD` | 只在该日期创建 1 条课做验证 |
 | `--sample` | 用假数据预览，不联网 |
+| `--no-weather` | 跳过北京各区天气抓取 |
+| `--weather-only` | 只抓天气 + 适宜度表后退出（不联网 OTM / 不调 LLM，验证用） |
+| `--rest [DATE]` | 标记某日为休息日（默认明天；可给 `today`/`YYYY-MM-DD`）后退出。标记今日会立即删当日计划课。该日 `--auto` 会**跳过 AI、移除计划**（省 token） |
+| `--rest-clear [DATE\|all]` | 取消休息日标记（给日期或 `all` 全清） |
+| `--regen` | 强制重新生成 AI 计划（忽略降频复用，单次仍调教练） |
 | `--no-coach` | 不调教练（只看数据，不生成计划） |
 | `--raw` | 原始 JSON 落盘（调试字段用） |
 | `--no-save` | 只打印到屏幕，不生成 .md |

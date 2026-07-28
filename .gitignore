@@ -10,6 +10,11 @@ report_*.md
 data_*.json
 imported_*.json
 
+# 运行状态/日期标记（非敏感，保持仓库干净；与 .readiness_last_trigger 一致）
+rest_flags.json
+last_auto_run.txt
+last_plan_gen.txt
+
 # Python 缓存
 __pycache__/
 *.pyc
