@@ -133,6 +133,40 @@ def _auto_crash_handler():
 atexit.register(_auto_crash_handler)
 
 
+# --auto 并发锁：readiness 多次更新触发 / cron 与触发同时跑时，只让一个 --auto 跑（避免日历/config 写冲突）
+AUTO_LOCK = os.path.join(HERE, ".auto.lock")
+
+
+def _acquire_auto_lock(stale_sec=600):
+    """独占获取 --auto 锁。拿到返回 True；已有运行中（锁新鲜）返回 False；过期(>stale_sec)锁自动抢占。"""
+    pid = str(os.getpid()).encode()
+    try:
+        fd = os.open(AUTO_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, pid); os.close(fd)
+        return True
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(AUTO_LOCK)
+        except OSError:
+            age = stale_sec + 1
+        if age < stale_sec:
+            return False
+        try:  # 过期锁：抢占
+            os.remove(AUTO_LOCK)
+            fd = os.open(AUTO_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, pid); os.close(fd)
+            return True
+        except OSError:
+            return False
+
+
+def _release_auto_lock():
+    try:
+        os.remove(AUTO_LOCK)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # 配置 & HTTP 层
 # ---------------------------------------------------------------------------
@@ -2532,6 +2566,11 @@ def main():
                     return
             except FileNotFoundError:
                 pass
+        # 并发锁：readiness 多次更新触发 / cron 与触发同时跑时，只让一个 --auto 跑
+        if not _acquire_auto_lock():
+            log("已有 --auto 在运行中，跳过本次（数据变化会在那次跑里体现）。")
+            _AUTO_CRASH_CTX["done"] = True
+            return
         os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)  # 供 cron 重定向 logs/auto.log
         args.push = True
         args.do_import = True
@@ -2784,6 +2823,7 @@ def main():
             pass
         _AUTO_CRASH_CTX["done"] = True  # 正常完成，抑制崩溃兜底告警
         _AUTO_CRASH_CTX["cfg"] = {}      # 清掉 cfg 引用（不再需要）
+        _release_auto_lock()
         log("==== 自动运行结束 ====\n")
 
 

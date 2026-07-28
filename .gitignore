@@ -14,6 +14,7 @@ imported_*.json
 rest_flags.json
 last_auto_run.txt
 last_plan_gen.txt
+.auto.lock
 
 # Python 缓存
 __pycache__/

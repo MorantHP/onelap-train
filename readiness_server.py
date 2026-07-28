@@ -83,24 +83,26 @@ def validate_payload(obj):
     return True, out
 
 
-def maybe_trigger_auto(enabled):
-    """开启时，若今日尚未触发过，后台跑一次 onelap_report.py --auto（按日期去重，防快捷指令重试导致重复）。"""
+def maybe_trigger_auto(enabled, data):
+    """开启时，readiness 数据【有变化】就后台跑一次 onelap_report.py --auto --force。
+    按数据签名去重：同样的数据重传（快捷指令重试）不重跑；数据真的变了才跑。
+    并发由 onelap_report 的 .auto.lock 兜底（多次快速变化时只跑一个，其余跳过）。"""
     if not enabled:
         return False
-    today = _today_iso()
+    sig = "|".join(f"{data.get(k, '')}" for k in ("date", "sleep_h", "hrv_ms", "rhr_bpm", "subjective"))
     try:
         last = open(TRIGGER_FLAG, encoding="utf-8").read().strip()
     except FileNotFoundError:
         last = ""
-    if last == today:
-        return False
+    if last == sig:
+        return False  # 数据未变化（重传/重复），不重跑
     os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)
     log_f = open(AUTO_LOG, "a", encoding="utf-8")
-    subprocess.Popen([sys.executable, os.path.join(HERE, "onelap_report.py"), "--auto"],
+    subprocess.Popen([sys.executable, os.path.join(HERE, "onelap_report.py"), "--auto", "--force"],
                      cwd=HERE, stdout=log_f, stderr=subprocess.STDOUT,
                      start_new_session=True)  # detached：HTTP 响应立刻返回
     try:
-        open(TRIGGER_FLAG, "w", encoding="utf-8").write(today)
+        open(TRIGGER_FLAG, "w", encoding="utf-8").write(sig)
     except Exception:
         pass
     return True
@@ -168,7 +170,7 @@ class Handler(BaseHTTPRequestHandler):
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, READINESS_PATH)
         R.append_readiness_history(data)
-        triggered = maybe_trigger_auto(self.trigger_auto)
+        triggered = maybe_trigger_auto(self.trigger_auto, data)
         sc = R.readiness_score(data, R.readiness_baseline(_today_iso()))
         self._send(200, {"ok": True, "readiness": data,
                          "score": sc, "triggered_auto": triggered})
