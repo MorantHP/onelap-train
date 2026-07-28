@@ -1051,19 +1051,24 @@ def append_readiness_history(rd):
         pass
 
 
-def readiness_baseline(today=None, window=7):
-    """返回近期（默认最近 window 天，含今日）HRV/静息心率/睡眠 的滚动均值作为个人基线。样本不足返回 None。"""
+def readiness_baseline(today=None, window=14, min_n=6):
+    """返回近期（默认最近 window 天，今天之前）HRV/静息心率/睡眠 的【中位数】作为个人基线。
+    每项独立门槛：该项样本 < min_n 则返回 None（评分该项降级为绝对阈值）。
+    用中位数而非均值：抗偶发坏数据/测试污染；min_n：数据不够就不强行算基线。"""
     recs = _read_readiness_history()
     if today is not None:
         iso = today.isoformat() if hasattr(today, "isoformat") else str(today)
         recs = [r for r in recs if r.get("date") and r["date"] < iso]  # 基线只取【今天之前】的常态
     recs = recs[-window:]
 
-    def avg(key):
-        vals = [r.get(key) for r in recs if isinstance(r.get(key), (int, float))]
-        return sum(vals) / len(vals) if vals else None
+    def median(key):
+        vals = sorted(r.get(key) for r in recs if isinstance(r.get(key), (int, float)))
+        if len(vals) < min_n:
+            return None
+        n = len(vals)
+        return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
 
-    hrv, rhr, slp = avg("hrv_ms"), avg("rhr_bpm"), avg("sleep_h")
+    hrv, rhr, slp = median("hrv_ms"), median("rhr_bpm"), median("sleep_h")
     if hrv is None and rhr is None:
         return None
     return {"hrv_ms": hrv, "rhr_bpm": rhr, "sleep_h": slp, "n": len(recs)}
@@ -1714,6 +1719,7 @@ def _feishu_card_elements(content):
 _CH_BLUE = (0, 114, 178)      # CTL / 计划柱
 _CH_SKY = (86, 180, 233)      # 计划柱（浅）
 _CH_VERM = (213, 94, 0)       # ATL / 实际柱
+_CH_GREEN = (0, 158, 115)     # 睡眠/恢复（Okabe-Ito green）
 _CH_INK = (40, 44, 52)
 _CH_MUTED = (150, 156, 166)
 _CH_GRID = (232, 234, 237)
@@ -1847,6 +1853,66 @@ def chart_pmc_load(pmc_pts, title="体能 CTL / 疲劳 ATL（红带=TSB<0 过载
     # 首尾日期
     dr.text((left, bottom + 8), str(pts[0][0])[:10], font=f_tick, fill=_CH_MUTED)
     dr.text((right - 40, bottom + 8), str(pts[-1][0])[:10], font=f_tick, fill=_CH_MUTED)
+    return _img_to_png(img)
+
+
+def chart_readiness_trend(history, baseline, today, days=21,
+                          title="readiness 趋势（HRV / 静息心率 / 睡眠）"):
+    """3 面板小图（HRV/静息心率/睡眠），各面板独立纵轴 + 基线虚线。最近 days 天（今天之前）。
+    返回 PNG bytes 或 None（无 PIL / 数据不足）。"""
+    if not HAVE_PIL or not history:
+        return None
+    iso_today = today.isoformat() if hasattr(today, "isoformat") else str(today)[:10]
+    pts = [r for r in history if r.get("date") and r["date"] < iso_today][-days:]
+    pts = [r for r in pts if any(isinstance(r.get(k), (int, float))
+                                 for k in ("hrv_ms", "rhr_bpm", "sleep_h"))]
+    if len(pts) < 2:
+        return None
+    W, H = 760, 470
+    img = Image.new("RGB", (W, H), (255, 255, 255))
+    dr = ImageDraw.Draw(img)
+    f_title = _pil_font(18, bold=True); f_lbl = _pil_font(13); f_tick = _pil_font(11)
+    dr.text((20, 8), title, font=f_title, fill=_CH_INK)
+    bl = baseline or {}
+    panels = [
+        ("HRV (ms)", [p.get("hrv_ms") for p in pts], bl.get("hrv_ms"), _CH_BLUE, 60),
+        ("静息心率 (bpm)", [p.get("rhr_bpm") for p in pts], bl.get("rhr_bpm"), _CH_VERM, 196),
+        ("睡眠 (h)", [p.get("sleep_h") for p in pts], bl.get("sleep_h"), _CH_GREEN, 332),
+    ]
+    left, right = 56, W - 16
+    n = len(pts)
+    for name, series, baseval, color, ytop in panels:
+        ybot = ytop + 92
+        dr.text((left, ytop - 18), name, font=f_lbl, fill=_CH_INK)
+        vals = [v for v in series if isinstance(v, (int, float))]
+        if len(vals) < 2:
+            dr.text((left + 4, ytop + 30), "数据不足", font=f_tick, fill=_CH_MUTED)
+            continue
+        vmin = min(vals) * 0.95
+        vmax = max(vals) * 1.05
+        if vmax <= vmin:
+            vmax = vmin + 1
+        span = vmax - vmin
+        if isinstance(baseval, (int, float)) and vmin <= baseval <= vmax:
+            by = ybot - (baseval - vmin) / span * (ybot - ytop)
+            for x in range(left, right, 8):  # 基线虚线
+                dr.line([(x, by), (x + 4, by)], fill=_CH_MUTED, width=1)
+            dr.text((right - 64, by - 6), f"基线 {baseval:.0f}", font=f_tick, fill=_CH_MUTED)
+        xy = []
+        for i, v in enumerate(series):
+            if isinstance(v, (int, float)):
+                x = left + (right - left) * (i / (n - 1))
+                y = ybot - (v - vmin) / span * (ybot - ytop)
+                xy.append((x, y))
+        if len(xy) >= 2:
+            dr.line(xy, fill=color, width=2)
+        if xy:  # 最新点标个圆点
+            lx, ly = xy[-1]
+            dr.ellipse([lx - 3, ly - 3, lx + 3, ly + 3], fill=color)
+        dr.text((4, ytop), f"{vmax:.0f}", font=f_tick, fill=_CH_MUTED)
+        dr.text((4, ybot - 12), f"{vmin:.0f}", font=f_tick, fill=_CH_MUTED)
+    dr.text((left, H - 16), pts[0]["date"], font=f_tick, fill=_CH_MUTED)
+    dr.text((right - 40, H - 16), pts[-1]["date"], font=f_tick, fill=_CH_MUTED)
     return _img_to_png(img)
 
 
@@ -2667,7 +2733,8 @@ def main():
                                              today, days_back=min(args.days_back, 21))
                 _p1 = chart_planned_vs_actual(_rows, f"计划 vs 实际 TSS（近 {len(_rows)} 天）")
                 _p2 = chart_pmc_load(_pmc[-45:])
-                charts = [p for p in (_p1, _p2) if p]
+                _p3 = chart_readiness_trend(_read_readiness_history(), readiness_baseline(today), today)
+                charts = [p for p in (_p1, _p2, _p3) if p]
             except Exception as e:
                 log(f"图表生成失败，跳过：{e}")
                 charts = []

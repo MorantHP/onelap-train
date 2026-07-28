@@ -373,5 +373,49 @@ class PlannedActualRowsTests(unittest.TestCase):
             self.assertTrue(png and png[:8] == b"\x89PNG\r\n\x1a\n")
 
 
+class ReadinessBaselineTests(unittest.TestCase):
+    def _hist(self, pairs, key="hrv_ms"):
+        return [{"date": (date(2026, 7, 27) - timedelta(days=o)).isoformat(), key: v}
+                for o, v in pairs]
+
+    def test_median_ignores_outlier(self):
+        # 7 天含一个离群 200，中位数应忽略它
+        recs = self._hist([(1, 50), (2, 52), (3, 48), (4, 200), (5, 51), (6, 49), (7, 53)])
+        orig = R._read_readiness_history
+        R._read_readiness_history = lambda: recs
+        try:
+            b = R.readiness_baseline(date(2026, 7, 27), window=14, min_n=6)
+            self.assertIsNotNone(b)
+            self.assertAlmostEqual(b["hrv_ms"], 51)   # [48,49,50,51,52,53,200] 中位数 51
+        finally:
+            R._read_readiness_history = orig
+
+    def test_insufficient_returns_none(self):
+        recs = self._hist([(1, 50), (2, 52)])          # 仅 2 天 < min_n
+        orig = R._read_readiness_history
+        R._read_readiness_history = lambda: recs
+        try:
+            self.assertIsNone(R.readiness_baseline(date(2026, 7, 27), window=14, min_n=6))
+        finally:
+            R._read_readiness_history = orig
+
+
+class ReadinessTrendChartTests(unittest.TestCase):
+    def test_renders_png_or_none(self):
+        recs = [{"date": (date(2026, 7, 27) - timedelta(days=o)).isoformat(),
+                 "hrv_ms": 40 + o, "rhr_bpm": 52 - 0.1 * o, "sleep_h": 6 + 0.1 * o}
+                for o in range(1, 15)]
+        bl = {"hrv_ms": 45.0, "rhr_bpm": 53.0, "sleep_h": 6.5, "n": 14}
+        if not R.HAVE_PIL:
+            self.assertIsNone(R.chart_readiness_trend(recs, bl, date(2026, 7, 27)))
+        else:
+            png = R.chart_readiness_trend(recs, bl, date(2026, 7, 27))
+            self.assertTrue(png and png[:8] == b"\x89PNG\r\n\x1a\n")
+
+    def test_too_few_returns_none(self):
+        self.assertIsNone(R.chart_readiness_trend(
+            [{"date": "2026-07-26", "hrv_ms": 40}], None, date(2026, 7, 27)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
