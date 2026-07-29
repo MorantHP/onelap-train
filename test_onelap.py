@@ -513,5 +513,21 @@ class PowerZoneTests(unittest.TestCase):
         self.assertFalse(rows2[0]["mismatch"])
 
 
+class RunTssTests(unittest.TestCase):
+    def test_with_hr(self):
+        tss, est = R.run_tss(3600, 162, 180)   # 60min, IF=0.9 → 81
+        self.assertFalse(est)
+        self.assertAlmostEqual(tss, 81.0, places=1)
+
+    def test_without_hr_estimated(self):
+        tss, est = R.run_tss(3600)             # 60min, IF=0.8 → 64, 估算
+        self.assertTrue(est)
+        self.assertAlmostEqual(tss, 64.0, places=1)
+
+    def test_zero(self):
+        self.assertEqual(R.run_tss(0), (0.0, False))
+        self.assertEqual(R.run_tss(None), (0.0, False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1293,6 +1293,16 @@ def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None, exec
                  f"{fmt_num(r['distance_km'],0)}km|{fmt_num(r['avg_power'],0)}|{fmt_num(r['avg_hr'],0)}")
     u.append("")
 
+    # 跑步（交叉训练叠加层，不并入 OTM PMC，但计入总负荷避免叠加过载）
+    _runs_recent = [r for r in _read_run_history()
+                    if (today - timedelta(days=13)).isoformat() <= r.get("date", "") <= today.isoformat()]
+    if _runs_recent:
+        _rtss = sum((r.get("tss") or 0) for r in _runs_recent)
+        u.append(f"**【最近跑步（交叉训练）】** 近 14 天 {len(_runs_recent)} 次"
+                 f"（最近 {_runs_recent[-1].get('date')}），合计 {_rtss:.0f} TSS（估算）。"
+                 f"排课时把跑步计入总负荷，避免骑行+跑步叠加过载。")
+        u.append("")
+
     u.append("**【营养目标：减脂增肌】**")
     u.append(f"- 蛋白 {int(w*1.8)}-{int(w*2.0)}g/天；强度日碳水 5-7g/kg、休息日 3-4g/kg；小幅热量缺口 −300~−400kcal；"
              f"长骑/强度课途中补碳水 30-60g/h，课后补碳水+蛋白。")
@@ -2510,6 +2520,22 @@ def zone_alignment_rows(planned_zone_by_d, rides, ftp, today, days_back=7):
         mismatch = bool(pz) and _ZONE_RANK.get(pz, 0) >= 4 and _ZONE_RANK.get(az, 0) <= 2 and az != ""
         rows.append({"date": iso, "planned_zone": pz, "actual_zone": az, "mismatch": mismatch})
     return rows
+
+
+RUN_IF_ASSUME = 0.8  # 跑步无心率时的假定强度因子（估算）
+
+
+def run_tss(duration_s, avg_hr=None, lthr=180):
+    """跑步 TSS。HR-based 优先：IF=clamp(avg_hr/lthr,0.5,1.2)，TSS=duration_h*IF²*100。
+    无 avg_hr 时退化为时长×RUN_IF_ASSUME（结果为估算）。返回 (tss, estimated_bool)。"""
+    if not duration_s or duration_s <= 0:
+        return 0.0, False
+    dur_h = duration_s / 3600.0
+    if avg_hr and lthr and lthr > 0:
+        ifr = max(0.5, min(1.2, float(avg_hr) / float(lthr)))
+        return round(dur_h * ifr * ifr * 100, 1), False
+    ifr = RUN_IF_ASSUME
+    return round(dur_h * ifr * ifr * 100, 1), True
 
 
 def _main_segments(zone, main_s, lo, hi, name):

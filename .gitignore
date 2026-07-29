@@ -31,3 +31,6 @@ _*.out
 # 赛后不适反馈（iPhone 上报）
 discomfort.json
 discomfort_history.jsonl
+
+# 跑步历史（Apple Health 解析）
+run_history.jsonl

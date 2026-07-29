@@ -23,12 +23,18 @@ from collections import defaultdict
 from datetime import datetime, date, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import onelap_report as R  # 复用 run_tss（跑步 TSS）
 HISTORY = os.path.join(HERE, "readiness_history.jsonl")
+RUN_HISTORY_OUT = os.path.join(HERE, "run_history.jsonl")
 
 RX_TYPE = re.compile(r'type="(HK[^"]*)"')
 RX_START = re.compile(r'startDate="(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?)')
 RX_END = re.compile(r'endDate="(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?)')
 RX_VAL = re.compile(r'value="([^"]*)"')
+RX_DUR = re.compile(r'duration="([^"]*)"')
+RX_DURUNIT = re.compile(r'durationUnit="([^"]*)"')
+RX_DIST = re.compile(r'totalDistance="([^"]*)"')
 
 
 def _median(vals):
@@ -39,15 +45,54 @@ def _median(vals):
     return round(vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2, 1)
 
 
+def _collect_run(line, cutoff, runs):
+    """从一条 <Workout HKWorkoutActivityTypeRunning ...> 行提取时长/距离/日期，聚合进 runs（按天累加）。"""
+    s = RX_START.search(line)
+    if not s:
+        return
+    day = s.group(1)[:10]
+    if day < cutoff:
+        return
+    dur = RX_DUR.search(line)
+    unit = RX_DURUNIT.search(line)
+    duration_s = None
+    if dur:
+        try:
+            d = float(dur.group(1))
+            u = (unit.group(1) if unit else "min").lower()
+            duration_s = d * 3600 if u.startswith("h") else d * 60  # 默认 min
+        except ValueError:
+            pass
+    dist = RX_DIST.search(line)
+    distance_km = None
+    if dist:
+        try:
+            distance_km = float(dist.group(1))
+        except ValueError:
+            pass
+    tss, _est = R.run_tss(duration_s)  # 暂无心率 → 估算
+    runs[day]["duration_s"] += duration_s or 0
+    if distance_km:
+        runs[day]["distance_km"] += distance_km
+    runs[day]["tss"] += tss
+
+
 def parse(path, days):
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     today = date.today().isoformat()
     hrv = defaultdict(list)        # date(ISO) -> [hrv...]
     rhr = defaultdict(list)
     sleep = defaultdict(float)     # wake date -> hours
+    runs = defaultdict(lambda: {"duration_s": 0.0, "distance_km": 0.0, "tss": 0.0})
     n = 0
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
+            if "<Workout " in line and "HKWorkoutActivityTypeRunning" in line:
+                _collect_run(line, cutoff, runs)
+                n += 1
+                if n % 200000 == 0:
+                    print(f"  已扫 {n} 行…", file=sys.stderr)
+                continue
             if "Record" not in line:
                 continue
             typ = RX_TYPE.search(line)
@@ -105,7 +150,15 @@ def parse(path, days):
         if sleep[d]:
             rec["sleep_h"] = round(sleep[d], 2)
         out.append(rec)
-    return out, {"hrv": len(hrv), "rhr": len(rhr), "sleep": len(sleep), "lines": n}
+    run_list = []
+    for d in sorted(runs):
+        if d >= today:
+            continue
+        v = runs[d]
+        run_list.append({"date": d, "duration_s": round(v["duration_s"]),
+                         "distance_km": round(v["distance_km"], 2) if v["distance_km"] else None,
+                         "tss": round(v["tss"], 1), "estimated": True})
+    return out, {"hrv": len(hrv), "rhr": len(rhr), "sleep": len(sleep), "runs": len(run_list), "lines": n}, run_list
 
 
 def main():
@@ -113,16 +166,33 @@ def main():
     ap.add_argument("xml", help="Apple Health export.xml / 导出.xml 路径")
     ap.add_argument("--days", type=int, default=90, help="只取最近 N 天（默认 90）")
     ap.add_argument("--merge", action="store_true", help="与现有历史合并（同日以导出为准）；默认整体覆盖")
+    ap.add_argument("--runs-only", action="store_true", help="只解析跑步写 run_history.jsonl，不动 readiness_history")
     args = ap.parse_args()
 
     if not os.path.exists(args.xml):
         sys.exit(f"找不到文件：{args.xml}")
     print(f"解析 {args.xml}（最近 {args.days} 天，1GB 约需 1-2 分钟）…", file=sys.stderr)
-    recs, stat = parse(args.xml, args.days)
-    print(f"完成：HRV {stat['hrv']} 天 / 静息心率 {stat['rhr']} 天 / 睡眠 {stat['sleep']} 天（扫 {stat['lines']} 行）",
+    recs, stat, run_list = parse(args.xml, args.days)
+    print(f"完成：HRV {stat['hrv']} / 静息心率 {stat['rhr']} / 睡眠 {stat['sleep']} / 跑步 {stat['runs']} 天（扫 {stat['lines']} 行）",
           file=sys.stderr)
+
+    # 跑步历史（交叉训练叠加层，写 run_history.jsonl）
+    if run_list:
+        with open(RUN_HISTORY_OUT, "w", encoding="utf-8") as f:
+            for r in run_list:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"✅ 已写入 {len(run_list)} 条跑步历史 → {RUN_HISTORY_OUT}", file=sys.stderr)
+        print("最近 5 条跑步：", file=sys.stderr)
+        for r in run_list[-5:]:
+            print("  " + json.dumps(r, ensure_ascii=False))
+
     if not recs:
-        sys.exit("该窗口内没解析到任何 readiness 数据，未写入。试试加大 --days 或确认文件。")
+        if not run_list:
+            sys.exit("该窗口内没解析到任何 readiness/跑步数据，未写入。试试加大 --days 或确认文件。")
+        sys.exit(0)  # 仅有跑步、无 readiness，正常退出
+
+    if args.runs_only:
+        sys.exit(0)  # 只写跑步，不动 readiness_history
 
     if os.path.exists(HISTORY) and not args.merge:
         bak = HISTORY + ".bak"
