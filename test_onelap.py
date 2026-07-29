@@ -487,5 +487,31 @@ class DiscomfortTests(unittest.TestCase):
             os.path.exists(tmp) and os.unlink(tmp)
 
 
+class PowerZoneTests(unittest.TestCase):
+    def test_power_to_zone(self):
+        ftp = 244
+        self.assertEqual(R.power_to_zone(120, ftp), "Z1")   # 49%
+        self.assertEqual(R.power_to_zone(150, ftp), "Z2")   # 61%
+        self.assertEqual(R.power_to_zone(200, ftp), "Z3")   # 82%
+        self.assertEqual(R.power_to_zone(220, ftp), "甜区")  # 90%
+        self.assertEqual(R.power_to_zone(245, ftp), "Z4")   # ~100%
+        self.assertEqual(R.power_to_zone(260, ftp), "Z5")   # 106%
+        self.assertEqual(R.power_to_zone(300, ftp), "Z6")   # 123%
+        self.assertEqual(R.power_to_zone(0, ftp), "")
+        self.assertEqual(R.power_to_zone(200, 0), "")
+
+    def test_zone_alignment_gross_mismatch(self):
+        today = date(2026, 7, 29)
+        rides = [{"date": date(2026, 7, 28), "avg_power": 150}]  # 61% → Z2
+        # 计划 Z4(rank5) 实际 Z2(rank2) → 明显错配
+        rows = R.zone_alignment_rows({"2026-07-28": "Z4"}, rides, 244, today, days_back=1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["actual_zone"], "Z2")
+        self.assertTrue(rows[0]["mismatch"])
+        # 计划 Z2 实际 Z2 → 不算错配
+        rows2 = R.zone_alignment_rows({"2026-07-28": "Z2"}, rides, 244, today, days_back=1)
+        self.assertFalse(rows2[0]["mismatch"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

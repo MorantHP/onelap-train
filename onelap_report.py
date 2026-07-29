@@ -1211,7 +1211,7 @@ def readiness_flag(rd, baseline=None):
     return f"（{'、'.join(bits)}{score_txt}）"
 
 
-def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None, exec_rows=None):
+def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None, exec_rows=None, zone_rows=None):
     if start_date is None:
         start_date = today + timedelta(days=1)  # 默认从明天起；--auto 从今天起
     prof = cfg.get("coach_profile") or {}
@@ -1286,6 +1286,20 @@ def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None, exec
         else:
             u.append("近期计划全部完成，执行良好。")
         u.append("")
+
+    # 强度命中率（计划 zone vs 实际 avg_power 落区，只标明显错配）
+    if zone_rows:
+        _pd = [r for r in zone_rows if r["planned_zone"]]
+        _mis = [r for r in _pd if r["mismatch"]]
+        if _pd:
+            _hit = (len(_pd) - len(_mis)) * 100 // len(_pd)
+            _line = (f"**【强度命中率】** 近 {len(_pd)} 个训练日，强度命中率约 {_hit}%"
+                     f"（按实际 avg_power 落区 vs 计划 zone；间歇课 avg 含热身/放松会偏低，仅供参考）")
+            if _mis:
+                _line += "；明显错配：" + "；".join(
+                    f"{r['date']} 计划{r['planned_zone']}/实际{r['actual_zone']}" for r in _mis) + "——核实是否练成了目标强度课。"
+            u.append(_line)
+            u.append("")
 
     u.append(f"请综合以上，为**从 {start_date.isoformat()}（{weekday_cn(start_date)}）起未来 {days_ahead} 天**制定计划。要求：")
     u.append("1) 先 2-3 句整体判断（当前状态/本周侧重/过载风险）。")
@@ -2382,6 +2396,63 @@ def zone_to_power(zone, if_score):
     return (60, 72)
 
 
+# %FTP 下界 → zone（_ZONE_POWER 的反向映射，把实际功率落到区间）
+_ZONE_BY_PCT_LO = [(120, "Z6"), (105, "Z5"), (95, "Z4"), (88, "甜区"), (75, "Z3"), (60, "Z2")]
+_ZONE_RANK = {"Z1": 1, "Z2": 2, "Z3": 3, "甜区": 4, "Z4": 5, "Z5": 6, "Z6": 7}
+
+
+def power_to_zone(avg_power_w, ftp):
+    """avg_power(W) → %FTP → zone 标签（Z1..Z6/甜区）。无功率/FTP → ""。
+    ⚠️ 单次骑行 avg_power 含热身/放松，会把 Z4 间歇摊低——仅适合判【明显错配】，非间歇精度。"""
+    if not avg_power_w or not ftp or ftp <= 0:
+        return ""
+    pct = avg_power_w / ftp * 100
+    for lo, z in _ZONE_BY_PCT_LO:
+        if pct >= lo:
+            return z
+    return "Z1"
+
+
+def planned_zone_by_date(scheduled_items, ftp):
+    """逐日计划 zone（IF→%FTP→power_to_zone，_guess_zone(name) 交叉）；同日多课取强度最高。
+    scheduled_items 用 list_planned_workouts() 输出（date 字符串、键 IF/name）。返回 {iso: zone}。"""
+    out = {}
+    for it in scheduled_items or []:
+        d = it.get("date")
+        iso = d.isoformat() if hasattr(d, "isoformat") else str(d)[:10]
+        if len(iso) != 10:
+            continue
+        name = first(it, "name", "title", default="")
+        gz = _guess_zone(name)
+        ifr = to_num(first(it, "if", "IF", "ifScore", "intensityFactor"))
+        z = gz or (power_to_zone((ifr or 0) * ftp, ftp) if ifr else "")
+        if z and (z not in out or _ZONE_RANK.get(z, 0) > _ZONE_RANK.get(out[iso], 0)):
+            out[iso] = z
+    return out
+
+
+def zone_alignment_rows(planned_zone_by_d, rides, ftp, today, days_back=7):
+    """近 days_back 天（不含今日）逐日：计划 zone vs 实际 zone（当日最高 avg_power 的骑行→zone）。
+    返回 [{date, planned_zone, actual_zone, mismatch}]。mismatch=True 仅标【明显错配】
+    （计划≥甜区/Z4 即 rank≥4 但实际≤Z2 即 rank≤2）。avg_power 对间歇不准，故只标明显错配。"""
+    by_date = {}
+    for r in rides or []:
+        iso = r["date"].isoformat() if hasattr(r["date"], "isoformat") else str(r["date"])[:10]
+        by_date.setdefault(iso, []).append(r)
+    rows = []
+    for i in range(days_back, 0, -1):
+        iso = (today - timedelta(days=i)).isoformat()
+        day = by_date.get(iso, [])
+        if not day:
+            continue
+        top = max(day, key=lambda r: r.get("avg_power") or 0)
+        az = power_to_zone(top.get("avg_power"), ftp)
+        pz = planned_zone_by_d.get(iso, "")
+        mismatch = bool(pz) and _ZONE_RANK.get(pz, 0) >= 4 and _ZONE_RANK.get(az, 0) <= 2 and az != ""
+        rows.append({"date": iso, "planned_zone": pz, "actual_zone": az, "mismatch": mismatch})
+    return rows
+
+
 def _main_segments(zone, main_s, lo, hi, name):
     """主体时段 → 段列表。Z5/Z6（VO2/无氧）拆成 on/off 微间歇并【封顶高强度总量】
     （Z5≤18min、Z6≤8min 停留在目标区），其余主体时间用 Z2 耐力填充——
@@ -2894,10 +2965,16 @@ def main():
         # /workout/list 是 OTM 课表规划器，对本账号为空 → 计划恒 0（执行率/图表/昨天漏练都会失真）。
         # planned（list）仍用 planned_workouts(cal_raw) 给 build_report 渲染（其 w["date"] 须为 date 对象）。
         try:
-            _planned_by_d = planned_tss_by_date(list_planned_workouts(cfg))
+            _scheduled = list_planned_workouts(cfg)
+            _planned_by_d = planned_tss_by_date(_scheduled)
+            # 强度命中率：计划 zone（按 IF/课名推断）vs 实际 avg_power 落区，只标明显错配
+            _ftp = (cfg.get("coach_profile") or {}).get("ftp")
+            _planned_zone_by_d = planned_zone_by_date(_scheduled, _ftp)
+            _zone_rows = zone_alignment_rows(_planned_zone_by_d, rides, _ftp, today)
         except Exception as e:
-            log(f"已排课读取失败，执行率/图表/漏练判定将缺计划数据：{e}")
+            log(f"已排课读取失败，执行率/图表/漏练/强度判定将缺计划数据：{e}")
             _planned_by_d = {}
+            _zone_rows = []
         try:  # 训练执行率：计划 TSS（已排课）vs 实际 TSS（PMC），近 days_back 天
             exec_rate = execution_rate(_planned_by_d, actual_tss_by_date(_pmc),
                                        today, days_back=args.days_back)
@@ -2974,7 +3051,8 @@ def main():
             # 给教练的执行情况排除今日（今日未结束，actual 多为 0，会误显"未完成"）
             _exec_rows_past = [r for r in _exec_rows if r["date"] != today.isoformat()]
             system, user = build_coach_prompt(cfg, _pmc, rides, today, args.days_ahead,
-                                              start_date=start_date, exec_rows=_exec_rows_past)
+                                              start_date=start_date, exec_rows=_exec_rows_past,
+                                              zone_rows=_zone_rows)
             attempts = (args.retries if args.retries and args.retries > 0 else 12) if args.auto else 1
             raw = None
             for attempt in range(attempts):
