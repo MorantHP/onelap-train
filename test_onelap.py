@@ -417,5 +417,33 @@ class ReadinessTrendChartTests(unittest.TestCase):
             [{"date": "2026-07-26", "hrv_ms": 40}], None, date(2026, 7, 27)))
 
 
+class RefreshTokenDaysLeftTests(unittest.TestCase):
+    def _make(self, exp, segs):
+        # segs=2 → OTM 真实格式 payload.signature；segs=3 → 标准 JWT header.payload.signature
+        import base64, json
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"exp": exp}).encode("ascii")).rstrip(b"=").decode("ascii")
+        return f"{payload}.sig" if segs == 2 else f"hdr.{payload}.sig"
+
+    def test_two_segment_otm_format(self):
+        import time
+        now = int(time.time())
+        d = R.refresh_token_days_left({"refresh_token": self._make(now + 10 * 86400, 2)})
+        self.assertIsNotNone(d)
+        self.assertTrue(9.9 < d < 10.1, d)
+
+    def test_three_segment_jwt(self):
+        import time
+        now = int(time.time())
+        d = R.refresh_token_days_left({"refresh_token": self._make(now + 5 * 86400, 3)})
+        self.assertIsNotNone(d)
+        self.assertTrue(4.9 < d < 5.1, d)
+
+    def test_non_jwt_returns_none(self):
+        self.assertIsNone(R.refresh_token_days_left({"refresh_token": "not-a-jwt"}))
+        self.assertIsNone(R.refresh_token_days_left({}))
+        self.assertIsNone(R.refresh_token_days_left({"refresh_token": ""}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -24,6 +24,7 @@ Onelap OTM 训练分析报告
 
 import argparse
 import atexit
+import base64
 import json
 import math
 import os
@@ -232,6 +233,26 @@ def refresh_access_token(cfg):
         cfg["refresh_token"] = data["refresh_token"]  # refresh_token 每次轮换，必须持久化新的
     save_config(cfg)
     return cfg, True
+
+
+def refresh_token_days_left(cfg):
+    """估算 refresh_token 剩余有效天数（解 token 的 payload 取 exp；无法解析返回 None）。
+    OTM refresh_token 约 60 天有效且不轮换——快到期需主动提醒，否则某天自动流程会静默断档。
+    OTM token 实为 payload.signature（无 header 段，2 段），与标准 JWT（3 段）不同，
+    故遍历各段、取第一个能解出 exp 的 JSON。"""
+    tok = (cfg.get("refresh_token") or "").strip()
+    if not tok or "." not in tok:
+        return None
+    for seg in tok.split("."):
+        try:
+            p = seg + "=" * (-len(seg) % 4)  # base64url 补齐 padding
+            info = json.loads(base64.urlsafe_b64decode(p.encode("ascii")).decode("utf-8"))
+            exp = info.get("exp") if isinstance(info, dict) else None
+            if exp:
+                return (int(exp) - int(time.time())) / 86400.0
+        except Exception:
+            continue
+    return None
 
 
 def api_request(cfg, path, method="POST", body=None, params=None):
@@ -2662,6 +2683,14 @@ def main():
             try:
                 cfg, refreshed = refresh_access_token(cfg)
                 log(f"token {'已刷新并写回 config' if refreshed else '未配 refresh_token，沿用静态 token'}")
+                # refresh_token 自身约 60 天有效且不轮换；快到期主动告警，避免某天静默断档
+                _left = refresh_token_days_left(cfg)
+                if _left is not None and _left < 7:
+                    log(f"⚠️ refresh_token 剩余 {_left:.1f} 天，已推送告警")
+                    push_alert(cfg, "⏰ OTM refresh_token 即将过期",
+                               f"refresh_token 剩余约 {_left:.1f} 天（约 60 天有效、不轮换）。\n"
+                               f"过期后自动刷新会失败、每日计划停止推送。\n"
+                               f"请在过期前重新登录 otm.onelap.cn 取新 refresh_token，更新 config.json。")
             except ApiError as e:
                 log(f"token 刷新失败：{e}（沿用旧 token，若已过期后续会 401）")
                 push_alert(cfg, "⚠️ OTM token 刷新失败",
