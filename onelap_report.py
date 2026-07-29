@@ -2790,8 +2790,16 @@ def main():
         rides = ride_items(rides_raw)
         planned = planned_workouts(cal_raw)
         _pmc = pmc_items(pmc_raw)  # 规整一次，供教练 prompt / TSB 投影 / 报告共用（避免重复解析、避免三处不一致）
-        try:  # 训练执行率：计划 TSS（课表）vs 实际 TSS（PMC），近 days_back 天
-            exec_rate = execution_rate(planned_tss_by_date(planned), actual_tss_by_date(_pmc),
+        # ⚠️ 计划 TSS 必须走 /workout/plan（已排课 list_planned_workouts）；get_workout_calendar 走的
+        # /workout/list 是 OTM 课表规划器，对本账号为空 → 计划恒 0（执行率/图表/昨天漏练都会失真）。
+        # planned（list）仍用 planned_workouts(cal_raw) 给 build_report 渲染（其 w["date"] 须为 date 对象）。
+        try:
+            _planned_by_d = planned_tss_by_date(list_planned_workouts(cfg))
+        except Exception as e:
+            log(f"已排课读取失败，执行率/图表/漏练判定将缺计划数据：{e}")
+            _planned_by_d = {}
+        try:  # 训练执行率：计划 TSS（已排课）vs 实际 TSS（PMC），近 days_back 天
+            exec_rate = execution_rate(_planned_by_d, actual_tss_by_date(_pmc),
                                        today, days_back=args.days_back)
         except Exception as e:
             log(f"执行率计算失败，跳过：{e}")
@@ -2799,7 +2807,7 @@ def main():
         # 训练图表（飞书卡片用，需 Pillow；无 Pillow/失败则跳过，不影响主流程）
         if HAVE_PIL:
             try:
-                _rows = _planned_actual_rows(planned_tss_by_date(planned), actual_tss_by_date(_pmc),
+                _rows = _planned_actual_rows(_planned_by_d, actual_tss_by_date(_pmc),
                                              today, days_back=min(args.days_back, 21))
                 _p1 = chart_planned_vs_actual(_rows, f"计划 vs 实际 TSS（近 {len(_rows)} 天）")
                 _p2 = chart_pmc_load(_pmc[-45:])
@@ -2816,8 +2824,7 @@ def main():
         _last_gen = read_date_flag(PLAN_GEN_FLAG)
         _refresh = int(cfg.get("plan_refresh_days", 3) or 3)
         # 计划执行情况：昨天有计划未完成 → 今日强制重排，并把近期执行情况同步给教练
-        _planned_by_d = planned_tss_by_date(planned)
-        _actual_by_d = actual_tss_by_date(_pmc)
+        _actual_by_d = actual_tss_by_date(_pmc)  # _planned_by_d 已用 list_planned_workouts 算好（见上）
         _exec_rows = execution_status_rows(_planned_by_d, _actual_by_d, today)
         _missed_yest = yesterday_missed(_planned_by_d, _actual_by_d, today)
         if _missed_yest:
