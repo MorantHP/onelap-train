@@ -115,6 +115,34 @@ systemctl enable --now onelap-readiness
 systemctl --no-pager --lines=3 status onelap-readiness 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
+c_blue "==== 5b/8  systemd heartbeat timer（每日心跳：--auto 停摆超 2 天就告警）===="
+cat > /etc/systemd/system/onelap-heartbeat.service <<EOF
+[Unit]
+Description=Onelap heartbeat (检测每日 --auto 是否停摆)
+
+[Service]
+Type=oneshot
+WorkingDirectory=$APP_DIR
+ExecStart=$PY_ABS $APP_DIR/onelap_report.py --heartbeat
+EOF
+cat > /etc/systemd/system/onelap-heartbeat.timer <<EOF
+[Unit]
+Description=Onelap heartbeat daily
+
+[Timer]
+OnCalendar=*-*-* 10:30:00
+Persistent=true
+Unit=onelap-heartbeat.service
+
+[Install]
+WantedBy=timers.target
+EOF
+timedatectl set-timezone Asia/Shanghai 2>/dev/null || true   # timer 按系统时区触发，须北京时间
+systemctl daemon-reload
+systemctl enable --now onelap-heartbeat.timer 2>/dev/null || true
+c_green "心跳 timer 已启用（每日 10:30 北京时间跑 --heartbeat）。"
+
+# ----------------------------------------------------------------------------
 c_blue "==== 6/8  触发方式：仅 readiness 上传触发（不装 cron）===="
 # --auto 只在 readiness 数据到达时由 onelap-readiness 服务后台触发(config.readiness_trigger_auto=true)。
 # 好处：没上传 readiness 的日子不跑、0 token，日历保留上次计划。

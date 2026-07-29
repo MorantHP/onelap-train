@@ -2119,6 +2119,7 @@ def actual_tss_by_date(pmc_pts):
 
 EXEC_DONE_RATIO = 0.7   # 实际/计划 TSS ≥ 0.7 视为完成；低于视为未完成（漏练）
 EXEC_MISS_MIN_TSS = 30  # 漏练触发重排的门槛：计划 TSS < 30（轻量/恢复日）漏练只告知教练、不强制重排
+HEARTBEAT_STALE_DAYS = 2  # --heartbeat：last_auto_run 距今超过这么多天则告警（自动化可能停摆）
 
 
 def execution_status_rows(planned_by_date, actual_by_date, today, days_back=7):
@@ -2616,6 +2617,8 @@ def main():
                          "标记今日会立即删除当日计划课。取消用 --rest-clear")
     ap.add_argument("--rest-clear", metavar="DATE", nargs="?", const="all",
                     help="取消休息日标记（给日期或 all 全清）后退出")
+    ap.add_argument("--heartbeat", action="store_true",
+                    help="心跳检查：读 last_auto_run.txt，若距上次成功 --auto 超过 %d 天则推送告警。供 systemd timer 每日调用。" % HEARTBEAT_STALE_DAYS)
     args = ap.parse_args()
 
     # --days-ahead：命令行优先；没传就读 config.json 的 days_ahead，再默认 14
@@ -2627,6 +2630,28 @@ def main():
         args.days_ahead = int(_c.get("days_ahead", 14) or 14)
 
     today = date.today()
+
+    if getattr(args, "heartbeat", False):
+        # 心跳：last_auto_run.txt 距今 > HEARTBEAT_STALE_DAYS → 推送告警（自动化可能停摆）
+        cfg = load_config()
+        _guard = os.path.join(HERE, "last_auto_run.txt")
+        try:
+            _last = datetime.strptime(open(_guard, encoding="utf-8").read().strip()[:10], "%Y-%m-%d").date()
+        except Exception:
+            _last = None
+        if _last is None:
+            push_alert(cfg, "⚠️ 训练自动化停摆",
+                       "未找到 last_auto_run.txt（--auto 从未成功跑过）。检查服务器 onelap-readiness 服务 + iPhone 触发链路。")
+        else:
+            _age = (today - _last).days
+            if _age >= HEARTBEAT_STALE_DAYS:
+                push_alert(cfg, "⚠️ 训练自动化停摆",
+                           f"上次成功 --auto 在 {_age} 天前（{_last.isoformat()}）。"
+                           f"可能：服务挂了 / iPhone 没推 readiness / 端点不通。请排查。")
+            else:
+                log(f"心跳正常：上次 --auto 在 {_age} 天前（{_last.isoformat()}）。")
+        return
+
     cfg = {}
     coach_md = None
     coach_plan = None
