@@ -459,8 +459,9 @@ class ExecutionStatusTests(unittest.TestCase):
 
     def test_yesterday_missed(self):
         today = date(2026, 7, 29)
-        self.assertTrue(R.yesterday_missed({"2026-07-28": 100}, {"2026-07-28": 20}, today))   # 20% 漏练
+        self.assertTrue(R.yesterday_missed({"2026-07-28": 100}, {"2026-07-28": 20}, today))   # 实质性课(100) 20% 漏练 → 重排
         self.assertFalse(R.yesterday_missed({"2026-07-28": 100}, {"2026-07-28": 75}, today))  # 75% 完成
+        self.assertFalse(R.yesterday_missed({"2026-07-28": 15}, {"2026-07-28": 0}, today))    # 轻恢复日(TSS15) 漏练 → 不重排
         self.assertFalse(R.yesterday_missed({}, {"2026-07-28": 50}, today))                   # 昨天无计划
 
 

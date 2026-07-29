@@ -2117,7 +2117,8 @@ def actual_tss_by_date(pmc_pts):
     return out
 
 
-EXEC_DONE_RATIO = 0.7  # 实际/计划 TSS ≥ 0.7 视为完成；低于视为未完成（漏练）
+EXEC_DONE_RATIO = 0.7   # 实际/计划 TSS ≥ 0.7 视为完成；低于视为未完成（漏练）
+EXEC_MISS_MIN_TSS = 30  # 漏练触发重排的门槛：计划 TSS < 30（轻量/恢复日）漏练只告知教练、不强制重排
 
 
 def execution_status_rows(planned_by_date, actual_by_date, today, days_back=7):
@@ -2134,11 +2135,12 @@ def execution_status_rows(planned_by_date, actual_by_date, today, days_back=7):
     return rows
 
 
-def yesterday_missed(planned_by_date, actual_by_date, today, threshold=EXEC_DONE_RATIO):
-    """昨天有训练计划但未完成（实际 < threshold*计划）→ True；昨天无计划/休息日 → False。"""
+def yesterday_missed(planned_by_date, actual_by_date, today, threshold=EXEC_DONE_RATIO, min_tss=EXEC_MISS_MIN_TSS):
+    """昨天有【实质性】训练课（计划 TSS ≥ min_tss）但未完成（实际 < threshold*计划）→ True，触发今日重排。
+    轻量/恢复日（计划 TSS < min_tss）漏练不触发重排（只在教练执行情况里告知）；昨天无计划 → False。"""
     iso = (today - timedelta(days=1)).isoformat()
     p = float(planned_by_date.get(iso, 0) or 0)
-    if p <= 0:
+    if p < min_tss:
         return False
     return float(actual_by_date.get(iso, 0) or 0) < p * threshold
 
