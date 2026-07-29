@@ -445,5 +445,24 @@ class RefreshTokenDaysLeftTests(unittest.TestCase):
         self.assertIsNone(R.refresh_token_days_left({"refresh_token": ""}))
 
 
+class ExecutionStatusTests(unittest.TestCase):
+    def test_rows_and_done_flags(self):
+        today = date(2026, 7, 29)
+        planned = {"2026-07-28": 100, "2026-07-29": 50}   # 昨天100 今天50
+        actual = {"2026-07-28": 80, "2026-07-29": 0}      # 昨天80%(✅) 今天0(❌)
+        rows = R.execution_status_rows(planned, actual, today, days_back=1)  # 含 07-28, 07-29
+        by = {r["date"]: r for r in rows}
+        self.assertTrue(by["2026-07-28"]["done"])     # 80 ≥ 70
+        self.assertFalse(by["2026-07-29"]["done"])    # 0 < 35
+        rows2 = R.execution_status_rows({}, {}, today, days_back=1)  # 无计划日
+        self.assertTrue(all(r["done"] is None for r in rows2))
+
+    def test_yesterday_missed(self):
+        today = date(2026, 7, 29)
+        self.assertTrue(R.yesterday_missed({"2026-07-28": 100}, {"2026-07-28": 20}, today))   # 20% 漏练
+        self.assertFalse(R.yesterday_missed({"2026-07-28": 100}, {"2026-07-28": 75}, today))  # 75% 完成
+        self.assertFalse(R.yesterday_missed({}, {"2026-07-28": 50}, today))                   # 昨天无计划
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

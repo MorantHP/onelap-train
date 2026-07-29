@@ -1152,7 +1152,7 @@ def readiness_flag(rd, baseline=None):
     return f"（{'、'.join(bits)}{score_txt}）"
 
 
-def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None):
+def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None, exec_rows=None):
     if start_date is None:
         start_date = today + timedelta(days=1)  # 默认从明天起；--auto 从今天起
     prof = cfg.get("coach_profile") or {}
@@ -1212,6 +1212,21 @@ def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None):
     u.append(f"- 蛋白 {int(w*1.8)}-{int(w*2.0)}g/天；强度日碳水 5-7g/kg、休息日 3-4g/kg；小幅热量缺口 −300~−400kcal；"
              f"长骑/强度课途中补碳水 30-60g/h，课后补碳水+蛋白。")
     u.append("")
+
+    if exec_rows:
+        _missed = [r for r in exec_rows if r["done"] is False]
+        u.append("**【近期计划执行情况】**（实际/计划 TSS；完成 = 实际 ≥ 计划的 70%）")
+        u.append("日期|计划|实际|状态")
+        u.append("---|---|---|---")
+        for r in exec_rows:
+            _st = "休息/无计划" if r["done"] is None else ("✅完成" if r["done"] else "❌未完成")
+            u.append(f"{r['date']}|{r['planned']:.0f}|{r['actual']:.0f}|{_st}")
+        if _missed:
+            u.append(f"⚠️ 近期有 {len(_missed)} 天未完成计划（{', '.join(m['date'] for m in _missed)}）。"
+                     f"请把未完成的关键课（尤其昨日）顺延到今日或近期，或据此调整今日强度——勿简单跳过。")
+        else:
+            u.append("近期计划全部完成，执行良好。")
+        u.append("")
 
     u.append(f"请综合以上，为**从 {start_date.isoformat()}（{weekday_cn(start_date)}）起未来 {days_ahead} 天**制定计划。要求：")
     u.append("1) 先 2-3 句整体判断（当前状态/本周侧重/过载风险）。")
@@ -2102,6 +2117,32 @@ def actual_tss_by_date(pmc_pts):
     return out
 
 
+EXEC_DONE_RATIO = 0.7  # 实际/计划 TSS ≥ 0.7 视为完成；低于视为未完成（漏练）
+
+
+def execution_status_rows(planned_by_date, actual_by_date, today, days_back=7):
+    """近 days_back 天（含今日）逐日 计划/实际 TSS + 完成状态，供教练 prompt 与"昨天漏练"判定共用。
+    返回 [{date, planned, actual, done}]（升序，最旧→今日）：
+    done=True 完成 / False 未完成 / None 当日无计划（休息/空档）。"""
+    rows = []
+    for i in range(days_back, -1, -1):
+        iso = (today - timedelta(days=i)).isoformat()
+        p = float(planned_by_date.get(iso, 0) or 0)
+        a = float(actual_by_date.get(iso, 0) or 0)
+        rows.append({"date": iso, "planned": p, "actual": a,
+                     "done": (a >= p * EXEC_DONE_RATIO) if p > 0 else None})
+    return rows
+
+
+def yesterday_missed(planned_by_date, actual_by_date, today, threshold=EXEC_DONE_RATIO):
+    """昨天有训练计划但未完成（实际 < threshold*计划）→ True；昨天无计划/休息日 → False。"""
+    iso = (today - timedelta(days=1)).isoformat()
+    p = float(planned_by_date.get(iso, 0) or 0)
+    if p <= 0:
+        return False
+    return float(actual_by_date.get(iso, 0) or 0) < p * threshold
+
+
 def execution_rate(planned_by_date, actual_by_date, today, days_back=14):
     """近 days_back 天（含今日）训练执行率。只对 planned>0 的训练日计算（休息/空档日不计分母，
     避免休息日把分母撑大）。返回 {rate, planned_tss, actual_tss, train_days, rows[{date,planned,actual,rate}]}。"""
@@ -2774,8 +2815,16 @@ def main():
         is_rest = today.isoformat() in rest_dates
         _last_gen = read_date_flag(PLAN_GEN_FLAG)
         _refresh = int(cfg.get("plan_refresh_days", 3) or 3)
+        # 计划执行情况：昨天有计划未完成 → 今日强制重排，并把近期执行情况同步给教练
+        _planned_by_d = planned_tss_by_date(planned)
+        _actual_by_d = actual_tss_by_date(_pmc)
+        _exec_rows = execution_status_rows(_planned_by_d, _actual_by_d, today)
+        _missed_yest = yesterday_missed(_planned_by_d, _actual_by_d, today)
+        if _missed_yest:
+            log("⚠️ 昨日计划未完成，今日强制重排并同步给教练。")
         do_regen = (not is_rest) and (args.regen or not args.auto or not _last_gen
-                                      or (_last_gen and (today - _last_gen).days >= _refresh))
+                                      or (_last_gen and (today - _last_gen).days >= _refresh)
+                                      or _missed_yest)
         if is_rest:
             log("🛌 今日为休息日（你标记），跳过 AI 计划。")
             try:
@@ -2789,7 +2838,7 @@ def main():
             args.dry_run_import = False
         elif do_regen and not args.no_coach and (cfg.get("glm_api_key") or "").strip():
             system, user = build_coach_prompt(cfg, _pmc, rides, today, args.days_ahead,
-                                              start_date=start_date)
+                                              start_date=start_date, exec_rows=_exec_rows)
             attempts = (args.retries if args.retries and args.retries > 0 else 12) if args.auto else 1
             raw = None
             for attempt in range(attempts):
