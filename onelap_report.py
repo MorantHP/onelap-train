@@ -1131,6 +1131,32 @@ def recent_discomfort(today, days=7):
             if r.get("date", "") >= cutoff and r.get("pain") in ("腰", "颈")]
 
 
+RUN_HISTORY = os.path.join(HERE, "run_history.jsonl")
+
+
+def _read_run_history():
+    """读 run_history.jsonl（import_apple_health 解析 Apple Watch 跑步写入），按 date 去重保留最新，升序。"""
+    if not os.path.exists(RUN_HISTORY):
+        return []
+    by_date = {}
+    try:
+        with open(RUN_HISTORY, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                d = rec.get("date")
+                if d:
+                    by_date[d] = rec
+    except Exception:
+        return []
+    return [by_date[k] for k in sorted(by_date)]
+
+
 def readiness_baseline(today=None, window=14, min_n=6):
     """返回近期（默认最近 window 天，今天之前）HRV/静息心率/睡眠 的【中位数】作为个人基线。
     每项独立门槛：该项样本 < min_n 则返回 None（评分该项降级为绝对阈值）。
@@ -2254,6 +2280,39 @@ def execution_rate(planned_by_date, actual_by_date, today, days_back=14):
             "train_days": train_days, "rows": rows}
 
 
+def build_weekly_report(pmc, rides, today):
+    """近 7 天（含今日）周报：骑行+跑步合计 TSS、CTL/ATL/TSB 起末、关键课、下周建议。
+    跑步为交叉训练叠加层（来自 Apple Watch，不并入 OTM 的 PMC）。"""
+    start = today - timedelta(days=6)
+    L = [f"# 📅 周报 {start.isoformat()} ~ {today.isoformat()}", ""]
+    past = [x for x in pmc if start <= x[0] <= today]
+    if past:
+        s, e = past[0], past[-1]
+        L.append(f"**体能（PMC）**：CTL {fmt_num(s[1],0)}→{fmt_num(e[1],0)}，"
+                 f"ATL {fmt_num(s[2],0)}→{fmt_num(e[2],0)}，TSB {fmt_num(s[3],0)}→{fmt_num(e[3],0)}"
+                 + (f"（{tsb_interp(e[3])}）" if e[3] is not None else ""))
+    wk = [r for r in rides if start <= r["date"] <= today]
+    bike_tss = sum((r["tss"] or 0) for r in wk)
+    bike_km = sum((r["distance_km"] or 0) for r in wk)
+    bike_min = sum((r["duration_s"] or 0) for r in wk) / 60
+    L.append(f"\n**骑行**：{len(wk)} 次 / {bike_tss:.0f} TSS / {bike_km:.0f} km / {bike_min:.0f} min")
+    for r in wk[-5:]:
+        L.append(f"  - {r['date'].isoformat()} {first(r,'name',default='')}：{(r['tss'] or 0):.0f} TSS，"
+                 f"{(r['distance_km'] or 0):.0f}km，均功 {fmt_num(r['avg_power'],0)}W")
+    runs = [r for r in _read_run_history() if start.isoformat() <= r.get("date", "") <= today.isoformat()]
+    run_tss = sum((r.get("tss") or 0) for r in runs)
+    if runs:
+        L.append(f"\n**跑步（交叉训练）**：{len(runs)} 次 / {run_tss:.0f} TSS")
+    L.append(f"\n**本周合计训练负荷**：骑行 {bike_tss:.0f} + 跑步 {run_tss:.0f} = **{bike_tss + run_tss:.0f} TSS**")
+    if past:
+        e = past[-1]
+        L.append(f"\n**下周提示**：当前 TSB {fmt_num(e[3],0)}（{tsb_interp(e[3])}）。"
+                 + ("疲劳偏高，下周优先恢复 + 1 次强度课。" if (e[3] or 0) < -10
+                    else "状态良好，可安排 1 次长骑 + 1 次强度课，循序渐进。"))
+    L.append("\n_数据：骑行/PMC 来自 OTM，跑步来自 Apple Watch（交叉训练叠加层）。_")
+    return "\n".join(L)
+
+
 def build_report(pmc, rides, planned, training_plans, today, days_back, days_ahead, coach_md=None, coach_model="", weather=None, show_weekend=False, exec_rate=None):
     L = []
     L.append(f"# Onelap 训练分析报告  ·  {today.isoformat()}\n")
@@ -2763,7 +2822,11 @@ def main():
                     help="取消休息日标记（给日期或 all 全清）后退出")
     ap.add_argument("--heartbeat", action="store_true",
                     help="心跳检查：读 last_auto_run.txt，若距上次成功 --auto 超过 %d 天则推送告警。供 systemd timer 每日调用。" % HEARTBEAT_STALE_DAYS)
+    ap.add_argument("--weekly", action="store_true",
+                    help="输出近 7 天周报（骑行+跑步合计 TSS、体能变化、下周建议）后退出，可配合 --push")
     args = ap.parse_args()
+    if getattr(args, "weekly", False):
+        args.no_coach = True  # 周报不需要教练计划，跳过 glm 调用（省 token）
 
     # --days-ahead：命令行优先；没传就读 config.json 的 days_ahead，再默认 14
     if args.days_ahead is None:
@@ -3126,6 +3189,18 @@ def main():
             log(f"阶段建议计算失败，跳过：{e}")
     if _phase_adv:
         coach_md = (coach_md + "\n\n" + _phase_adv) if coach_md else _phase_adv
+
+    if getattr(args, "weekly", False):
+        wr = build_weekly_report(_pmc, rides, today)
+        print("\n" + wr)
+        if not args.no_save:
+            out = os.path.join(HERE, f"weekly_{today.isoformat()}.md")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(wr)
+            print(f"\n（周报已保存：{out}）", file=sys.stderr)
+        if args.push:
+            push_alert(cfg, f"Onelap 周报 {today.isoformat()}", wr)
+        return
 
     report = build_report(_pmc, rides, planned, training_plans,
                           today, args.days_back, args.days_ahead,
