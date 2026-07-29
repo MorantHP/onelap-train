@@ -2214,6 +2214,26 @@ def push_feishu(cfg, title, content, images=None):
     return False
 
 
+def _scheduled_to_planned(scheduled):
+    """把 list_planned_workouts() 输出（date 字符串、键 IF/TSS/duration）规整成 build_report 期望的
+    [{date:date对象, name, tss, duration_s, if_score}]——使 build_report 的 w["date"] 可做日期比较。
+    （get_workout_calendar 的 /workout/list 对本账号为空，故 build_report 改吃 /workout/plan 这个源。）"""
+    out = []
+    for it in scheduled or []:
+        d = parse_date(first(it, "date"))
+        if not d:
+            continue
+        out.append({
+            "date": d,
+            "name": first(it, "name", "title", default=""),
+            "tss": to_num(first(it, "TSS", "tss", "tss_score", "load_tss")),
+            "duration_s": to_num(first(it, "duration", "duration_s", "totalDuration")),
+            "if_score": to_num(first(it, "IF", "if", "ifScore", "intensityFactor")),
+        })
+    out.sort(key=lambda x: x["date"])
+    return out
+
+
 def planned_tss_by_date(planned_items):
     """汇总每日【计划】TSS → {ISO日期: tss}。planned_items 可为 planned_workouts() 输出
     （date 为 date 对象、键 tss）或 list_planned_workouts 原始项（date 为字符串、键 TSS）。"""
@@ -3048,20 +3068,23 @@ def main():
             print(f"  原始数据已写入：data_{today.isoformat()}.json", file=sys.stderr)
 
         rides = ride_items(rides_raw)
-        planned = planned_workouts(cal_raw)
         _pmc = pmc_items(pmc_raw)  # 规整一次，供教练 prompt / TSB 投影 / 报告共用（避免重复解析、避免三处不一致）
-        # ⚠️ 计划 TSS 必须走 /workout/plan（已排课 list_planned_workouts）；get_workout_calendar 走的
-        # /workout/list 是 OTM 课表规划器，对本账号为空 → 计划恒 0（执行率/图表/昨天漏练都会失真）。
-        # planned（list）仍用 planned_workouts(cal_raw) 给 build_report 渲染（其 w["date"] 须为 date 对象）。
+        # ⚠️ 已排课走 /workout/plan（list_planned_workouts）；get_workout_calendar 的 /workout/list 是
+        # OTM 课表规划器、对本账号为空。cal_raw 仅留给 --raw 落盘。
         try:
             _scheduled = list_planned_workouts(cfg)
+        except Exception as e:
+            log(f"已排课读取失败：{e}")
+            _scheduled = []
+        planned = _scheduled_to_planned(_scheduled)  # 给 build_report 渲染（date 已规整为 date 对象）
+        try:
             _planned_by_d = planned_tss_by_date(_scheduled)
             # 强度命中率：计划 zone（按 IF/课名推断）vs 实际 avg_power 落区，只标明显错配
             _ftp = (cfg.get("coach_profile") or {}).get("ftp")
             _planned_zone_by_d = planned_zone_by_date(_scheduled, _ftp)
             _zone_rows = zone_alignment_rows(_planned_zone_by_d, rides, _ftp, today)
         except Exception as e:
-            log(f"已排课读取失败，执行率/图表/漏练/强度判定将缺计划数据：{e}")
+            log(f"计划解析失败，执行率/图表/漏练/强度判定将缺数据：{e}")
             _planned_by_d = {}
             _zone_rows = []
         try:  # 训练执行率：计划 TSS（已排课）vs 实际 TSS（PMC），近 days_back 天

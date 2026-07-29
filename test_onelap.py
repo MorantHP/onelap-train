@@ -529,5 +529,21 @@ class RunTssTests(unittest.TestCase):
         self.assertEqual(R.run_tss(None), (0.0, False))
 
 
+class ScheduledToPlannedTests(unittest.TestCase):
+    def test_normalize_date_obj_and_sort(self):
+        items = [
+            {"date": "2026-08-01", "name": "Z2 长骑（计划）", "TSS": 88, "duration": 7200, "IF": 0.65},
+            {"date": "2026-07-31", "name": "Z2 耐力骑（计划）", "TSS": 35, "duration": 3600, "IF": 0.55},
+        ]
+        out = R._scheduled_to_planned(items)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(str(out[0]["date"]), "2026-07-31")      # 升序
+        self.assertIsInstance(out[0]["date"], date)              # date 对象（build_report 要做日期比较）
+        self.assertEqual(out[1]["tss"], 88)
+        self.assertEqual(out[0]["if_score"], 0.55)
+        # 脏 date 跳过
+        self.assertEqual(R._scheduled_to_planned([{"date": "乱来", "name": "x"}]), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
