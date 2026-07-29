@@ -2844,8 +2844,10 @@ def main():
             args.do_import = False
             args.dry_run_import = False
         elif do_regen and not args.no_coach and (cfg.get("glm_api_key") or "").strip():
+            # 给教练的执行情况排除今日（今日未结束，actual 多为 0，会误显"未完成"）
+            _exec_rows_past = [r for r in _exec_rows if r["date"] != today.isoformat()]
             system, user = build_coach_prompt(cfg, _pmc, rides, today, args.days_ahead,
-                                              start_date=start_date, exec_rows=_exec_rows)
+                                              start_date=start_date, exec_rows=_exec_rows_past)
             attempts = (args.retries if args.retries and args.retries > 0 else 12) if args.auto else 1
             raw = None
             for attempt in range(attempts):
