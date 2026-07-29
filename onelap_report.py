@@ -1072,6 +1072,65 @@ def append_readiness_history(rd):
         pass
 
 
+DISCOMFORT_PATH = os.path.join(HERE, "discomfort.json")
+DISCOMFORT_HISTORY = os.path.join(HERE, "discomfort_history.jsonl")
+
+
+def load_discomfort():
+    """读 discomfort.json（iPhone 捷径赛后上报：date/pain/note）。无则 None。"""
+    if not os.path.exists(DISCOMFORT_PATH):
+        return None
+    try:
+        return json.load(open(DISCOMFORT_PATH, encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _read_discomfort_history():
+    """读 discomfort_history.jsonl，按 date 去重保留最新，升序返回。"""
+    if not os.path.exists(DISCOMFORT_HISTORY):
+        return []
+    by_date = {}
+    try:
+        with open(DISCOMFORT_HISTORY, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                d = rec.get("date")
+                if d:
+                    by_date[d] = rec
+    except Exception:
+        return []
+    return [by_date[k] for k in sorted(by_date)]
+
+
+def append_discomfort_history(rec):
+    """把赛后不适记录追加进历史（按 date 去重保留最新）。幂等。"""
+    if not rec or not rec.get("date"):
+        return
+    keep = [r for r in _read_discomfort_history() if r.get("date") != rec["date"]]
+    keep.append({k: rec.get(k) for k in ("date", "pain", "note")})
+    keep.sort(key=lambda r: r.get("date", ""))
+    try:
+        with open(DISCOMFORT_HISTORY, "w", encoding="utf-8") as f:
+            for r in keep:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def recent_discomfort(today, days=7):
+    """近 days 天有不适（pain∈{腰,颈}）的记录，升序。供喂教练/报告。"""
+    cutoff = (today - timedelta(days=days - 1)).isoformat()
+    return [r for r in _read_discomfort_history()
+            if r.get("date", "") >= cutoff and r.get("pain") in ("腰", "颈")]
+
+
 def readiness_baseline(today=None, window=14, min_n=6):
     """返回近期（默认最近 window 天，今天之前）HRV/静息心率/睡眠 的【中位数】作为个人基线。
     每项独立门槛：该项样本 < min_n 则返回 None（评分该项降级为绝对阈值）。
@@ -1246,6 +1305,18 @@ def build_coach_prompt(cfg, pmc, rides, today, days_ahead, start_date=None, exec
                  "爬坡致腰疼→控制单次连续爬坡时长、穿插平路/伸展/核心训练；"
                  "平路或下坡致颈疼→分段骑行、变换握姿、加颈部放松与核心；"
                  "长课务必安排中途起身/变换姿势。")
+    # 赛后不适反馈（动态硬约束）：近期腰/颈不适 → 教练必须规避
+    _disc = recent_discomfort(today)
+    if _disc:
+        _disc_txt = "；".join(f"{d['date']} {d['pain']}" + (f"({d.get('note')})" if d.get('note') else "")
+                             for d in _disc)
+        u.append(f"【硬约束·近期不适】车手近期上报不适：{_disc_txt}。"
+                 "排课时须主动规避/缓解对应部位（腰→少连续爬坡/加核心；颈→分段平路/变换握姿），"
+                 "宁可降强度或换交叉训练，不得安排会加重它的课。")
+    # 过载兜底：若教练仍被调用且 TSB 已严重偏低 → 强制今日 rest/极轻
+    if tsb is not None and tsb < OVERREACH_TSB:
+        u.append(f"【硬约束·过度疲劳】当前 TSB={tsb:.0f} 已严重偏低，今日必须 action=rest 或仅 Z1 恢复，"
+                 "不得安排任何中高强度课。")
     return SYSTEM_COACH, "\n".join(u)
 
 
@@ -2120,6 +2191,8 @@ def actual_tss_by_date(pmc_pts):
 EXEC_DONE_RATIO = 0.7   # 实际/计划 TSS ≥ 0.7 视为完成；低于视为未完成（漏练）
 EXEC_MISS_MIN_TSS = 30  # 漏练触发重排的门槛：计划 TSS < 30（轻量/恢复日）漏练只告知教练、不强制重排
 HEARTBEAT_STALE_DAYS = 2  # --heartbeat：last_auto_run 距今超过这么多天则告警（自动化可能停摆）
+OVERREACH_TSB = -20         # 过载硬保护：TSB 低于此值 → 今日强制休息
+OVERREACH_RHR_DELTA = 5     # 过载硬保护：今日静息心率高于个人基线这么多 bpm → 今日强制休息
 
 
 def execution_status_rows(planned_by_date, actual_by_date, today, days_back=7):
@@ -2856,7 +2929,18 @@ def main():
         _missed_yest = yesterday_missed(_planned_by_d, _actual_by_d, today)
         if _missed_yest:
             log("⚠️ 昨日计划未完成，今日强制重排并同步给教练。")
-        do_regen = (not is_rest) and (args.regen or not args.auto or not _last_gen
+        # 过载硬保护：TSB 过低 或 静息心率异常偏高 → 今日强制休息（避免堆量致过训练/伤病）
+        _past_pmc = [x for x in _pmc if x[0] <= today]
+        _tsb = _past_pmc[-1][3] if _past_pmc else None
+        _base = readiness_baseline(today)
+        _rd_today = load_readiness() or {}
+        _rhr_today, _rhr_base = _rd_today.get("rhr_bpm"), (_base or {}).get("rhr_bpm")
+        _overreached = (_tsb is not None and _tsb < OVERREACH_TSB) or (
+            isinstance(_rhr_today, (int, float)) and isinstance(_rhr_base, (int, float))
+            and (_rhr_today - _rhr_base) >= OVERREACH_RHR_DELTA)
+        if _overreached:
+            log(f"🛑 过度疲劳（TSB={_tsb}, RHR 今日{_rhr_today}/基线{_rhr_base}）→ 今日强制休息。")
+        do_regen = (not is_rest) and (not _overreached) and (args.regen or not args.auto or not _last_gen
                                       or (_last_gen and (today - _last_gen).days >= _refresh)
                                       or _missed_yest)
         if is_rest:
@@ -2867,6 +2951,22 @@ def main():
                 log(f"删除今日计划课失败: {e}")
             coach_md = ("🛌 **今日休息**（你标记的休息日）。\n\n"
                         "已从 OTM 日历移除今日训练课。优先睡眠与恢复，明日按计划继续。")
+            coach_plan = None
+            args.do_import = False
+            args.dry_run_import = False
+        elif _overreached:
+            log("🛑 过度疲劳，今日强制休息（跳过强度课）。")
+            try:
+                cleanup_plan_on_date(cfg, today.isoformat())
+            except Exception as e:
+                log(f"删除今日计划课失败: {e}")
+            coach_md = ("🛑 **今日强制休息·过度疲劳**"
+                        + (f"（TSB {_tsb:.0f}，偏低）" if _tsb is not None and _tsb < OVERREACH_TSB else "")
+                        + (f"（静息心率 {_rhr_today} 高于基线 {_rhr_base}）"
+                           if isinstance(_rhr_today, (int, float)) and isinstance(_rhr_base, (int, float))
+                           and _rhr_today - _rhr_base >= OVERREACH_RHR_DELTA else "")
+                        + "。\n\n已从 OTM 日历移除今日强度课。今日只做恢复（Z1/散步/拉伸）或全休，"
+                          "优先睡眠，明日视状态恢复。")
             coach_plan = None
             args.do_import = False
             args.dry_run_import = False

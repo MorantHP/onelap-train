@@ -83,6 +83,23 @@ def validate_payload(obj):
     return True, out
 
 
+def validate_discomfort_payload(obj):
+    """校验 /discomfort POST body: {date?, pain∈{腰,颈,无}, note?}。返回 (ok, dict_or_errmsg)。"""
+    if not isinstance(obj, dict):
+        return False, "body 必须是 JSON 对象"
+    pain = str(obj.get("pain", "")).strip()
+    if pain not in ("腰", "颈", "无"):
+        return False, "pain 必须是 腰 / 颈 / 无"
+    d = obj.get("date") or _today_iso()
+    if not (isinstance(d, str) and len(d) == 10 and d[4] == "-" and d[7] == "-"):
+        return False, f"date 应为 YYYY-MM-DD: {d!r}"
+    out = {"date": d, "pain": pain}
+    note = obj.get("note")
+    if note:
+        out["note"] = str(note)[:200]
+    return True, out
+
+
 def maybe_trigger_auto(enabled, data):
     """开启时，readiness 数据【有变化】就后台跑一次 onelap_report.py --auto --force。
     按数据签名去重：同样的数据重传（快捷指令重试）不重跑；数据真的变了才跑。
@@ -140,12 +157,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, R.load_readiness() or {"readiness": None})
         elif path in ("/override", "/rest"):
             self._send(200, {"rest_dates": sorted(R.load_rest_flags())})
+        elif path in ("/discomfort", "/discomfort/latest"):
+            self._send(200, {"latest": R.load_discomfort(),
+                             "recent": R.recent_discomfort(datetime.date.today())})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path not in ("/readiness", "/override", "/rest"):
+        if path not in ("/readiness", "/override", "/rest", "/discomfort"):
             self._send(404, {"error": "not found"})
             return
         if not self._authed():
@@ -159,6 +179,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in ("/override", "/rest"):
             self._handle_override(obj)
+            return
+        if path == "/discomfort":
+            self._handle_discomfort(obj)
             return
         ok, data = validate_payload(obj)
         if not ok:
@@ -209,6 +232,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
         self._send(200, {"ok": True, "action": action, "date": date_iso, "rest": is_rest,
                          "cleaned_today": cleaned, "rest_dates": sorted(R.load_rest_flags())})
+
+    def _handle_discomfort(self, obj):
+        """POST /discomfort {date?, pain∈{腰,颈,无}, note?} → 原子写 discomfort.json + 追加历史。
+        不触发 --auto（避免每次上报都重排）；下次正常 readiness 触发时教练会读取并入硬约束。"""
+        ok, data = validate_discomfort_payload(obj)
+        if not ok:
+            self._send(400, {"error": data})
+            return
+        tmp = R.DISCOMFORT_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, R.DISCOMFORT_PATH)
+        R.append_discomfort_history(data)
+        self._send(200, {"ok": True, "discomfort": data,
+                         "recent": R.recent_discomfort(datetime.date.today())})
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))

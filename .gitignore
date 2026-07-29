@@ -26,3 +26,8 @@ _*.html
 _*.log
 _*.out
 *.tmp
+*.bak
+
+# 赛后不适反馈（iPhone 上报）
+discomfort.json
+discomfort_history.jsonl

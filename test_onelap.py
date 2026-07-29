@@ -465,5 +465,27 @@ class ExecutionStatusTests(unittest.TestCase):
         self.assertFalse(R.yesterday_missed({}, {"2026-07-28": 50}, today))                   # 昨天无计划
 
 
+class DiscomfortTests(unittest.TestCase):
+    def test_append_read_dedup_and_recent(self):
+        import os, tempfile
+        today = date(2026, 7, 29)
+        orig = R.DISCOMFORT_HISTORY
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl").name
+        R.DISCOMFORT_HISTORY = tmp
+        try:
+            R.append_discomfort_history({"date": "2026-07-27", "pain": "腰", "note": "爬坡后"})
+            R.append_discomfort_history({"date": "2026-07-28", "pain": "颈"})
+            R.append_discomfort_history({"date": "2026-07-28", "pain": "无"})  # 同日覆盖
+            hist = R._read_discomfort_history()
+            self.assertEqual([h["date"] for h in hist], ["2026-07-27", "2026-07-28"])  # 去重
+            self.assertEqual({h["date"]: h["pain"] for h in hist}, {"2026-07-27": "腰", "2026-07-28": "无"})
+            # recent_discomfort：仅 pain∈{腰,颈} 且在窗口内；07-28 是"无"不计
+            rec = R.recent_discomfort(today, days=3)  # 07-27~07-29
+            self.assertEqual([r["date"] for r in rec], ["2026-07-27"])
+        finally:
+            R.DISCOMFORT_HISTORY = orig
+            os.path.exists(tmp) and os.unlink(tmp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
